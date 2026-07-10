@@ -145,3 +145,88 @@ async def install_local(
 
     await _emit(STATE_INSTALLED)
     return InstallResult(status=STATE_INSTALLED, plugin=plugin, image_tag=tag)
+
+
+def _plugin_root(plugin: InstalledPlugin) -> Path:
+    """Build context for a plugin. ``InstalledPlugin.path`` points at the import
+    root, which is ``<root>/src`` under the standard layout; the Docker build
+    context must be the project root that holds the manifest and lockfile."""
+    p = Path(plugin.path)
+    return p.parent if p.name == "src" else p
+
+
+async def image_exists(tag: str, *, runtime: str = "docker") -> bool:
+    """True if the image tag is already present locally (``docker image inspect``)."""
+    proc = await asyncio.create_subprocess_exec(
+        runtime, "image", "inspect", tag,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    return (await proc.wait()) == 0
+
+
+async def _default_build(plugin: InstalledPlugin, tag: str, *, runtime: str = "docker") -> bool:
+    """Generate the Dockerfile and build the plugin's image. Returns ok."""
+    directory = _plugin_root(plugin)
+    (directory / "Dockerfile.catlico").write_text(generate_dockerfile(plugin))
+    ok, log = await build_image(directory, tag, runtime=runtime)
+    if not ok:
+        logger.error("build failed for %s:\n%s", tag, log)
+    return ok
+
+
+async def ensure_images(
+    plugins,
+    *,
+    runtime: str = "docker",
+    exists=None,
+    build=None,
+) -> dict[str, str]:
+    """Idempotently ensure every plugin has its per-plugin image built.
+
+    For each plugin: validate the manifest, skip the build if the image tag
+    already exists (``exists(tag)``), otherwise build it (``build(plugin, tag)``).
+    ``exists`` and ``build`` are injectable so unit tests need no Docker.
+
+    Per-plugin failures are isolated: a bad manifest, a failed build, or a
+    raising builder marks only that plugin ``failed`` and never propagates, so a
+    single broken plugin cannot stop the runner from starting. Returns a mapping
+    of ``plugin_id -> final state`` (``installed`` or ``failed``).
+    """
+    if exists is None:
+        async def exists(tag: str) -> bool:  # noqa: E306
+            return await image_exists(tag, runtime=runtime)
+    if build is None:
+        async def build(plugin: InstalledPlugin, tag: str) -> bool:  # noqa: E306
+            return await _default_build(plugin, tag, runtime=runtime)
+
+    states: dict[str, str] = {}
+    for plugin in plugins:
+        states[plugin.id] = await _ensure_one_image(plugin, exists=exists, build=build)
+    return states
+
+
+async def _ensure_one_image(plugin: InstalledPlugin, *, exists, build) -> str:
+    """Run the validate -> (skip | build) pipeline for one plugin, never raising."""
+    logger.info("%s: %s", plugin.id, STATE_VALIDATING)
+    errors = validate_manifest(plugin.manifest)
+    if errors:
+        logger.error("%s: %s — %s", plugin.id, STATE_FAILED, "; ".join(errors))
+        return STATE_FAILED
+
+    tag = image_tag(plugin.id, plugin.version)
+    try:
+        if await exists(tag):
+            logger.info("%s: %s (image %s already present)", plugin.id, STATE_INSTALLED, tag)
+            return STATE_INSTALLED
+        logger.info("%s: %s (%s)", plugin.id, STATE_BUILDING, tag)
+        ok = await build(plugin, tag)
+    except Exception:  # noqa: BLE001 — one bad plugin must not stop the runner
+        logger.exception("%s: %s — image build raised", plugin.id, STATE_FAILED)
+        return STATE_FAILED
+
+    if not ok:
+        logger.error("%s: %s — image build failed (%s)", plugin.id, STATE_FAILED, tag)
+        return STATE_FAILED
+    logger.info("%s: %s (%s)", plugin.id, STATE_INSTALLED, tag)
+    return STATE_INSTALLED

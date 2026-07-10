@@ -7,6 +7,7 @@ import logging
 import uvicorn
 
 from plugin_runner.client import PluginRunnerClient
+from plugin_runner.installer import STATE_INSTALLED, ensure_images
 from plugin_runner.registry import discover
 from plugin_runner.sandbox import ContainerSandboxRunner, SandboxRunner, SubprocessSandboxRunner
 from plugin_runner.server import create_app
@@ -21,6 +22,24 @@ def select_sandbox(settings: RunnerSettings) -> SandboxRunner:
     if settings.isolation_mode == "subprocess":
         return SubprocessSandboxRunner()
     return ContainerSandboxRunner()
+
+
+async def _ensure_plugin_images(sandbox: SandboxRunner, registry) -> None:
+    """Build any per-plugin container images the active adapter needs before we
+    start serving. Keyed off the adapter itself (not ``settings.isolation_mode``)
+    so this keeps working when the isolation default flips: only the container
+    adapter runs plugins from per-plugin images, so the subprocess adapter has
+    nothing to build. Broken plugins are logged and skipped, never fatal."""
+    if not isinstance(sandbox, ContainerSandboxRunner):
+        return
+    runtime = getattr(sandbox, "_runtime", "docker")
+    states = await ensure_images(registry.all(), runtime=runtime)
+    unavailable = sorted(pid for pid, state in states.items() if state != STATE_INSTALLED)
+    if unavailable:
+        logger.warning(
+            "plugin image(s) unavailable — runs for these will fail: %s",
+            ", ".join(unavailable),
+        )
 
 
 def _register_body(settings: RunnerSettings, registry) -> dict:
@@ -61,6 +80,9 @@ async def serve(settings: RunnerSettings | None = None) -> None:
     registry = discover(settings.plugin_dirs)
     logger.info("discovered %d plugin(s)", len(registry.all()))
 
+    sandbox = select_sandbox(settings)
+    await _ensure_plugin_images(sandbox, registry)
+
     client = PluginRunnerClient(settings.catlico_api_url, timeout=settings.http_timeout)
     await client.enroll(_register_body(settings, registry))
     logger.info("enrolled runner %s", settings.runner_id)
@@ -70,7 +92,7 @@ async def serve(settings: RunnerSettings | None = None) -> None:
         registry=registry,
         runner_id=settings.runner_id,
         api_base_url=settings.catlico_api_url,
-        sandbox=select_sandbox(settings),
+        sandbox=sandbox,
     )
     heartbeat = asyncio.create_task(_heartbeat_loop(client, settings, registry))
     config = uvicorn.Config(app, host=settings.host, port=settings.port, log_level="info")
