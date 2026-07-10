@@ -18,6 +18,7 @@ class PluginRunnerClient:
         base_url: str,
         secret: str = "",
         *,
+        push_signing_secret: str = "",
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
@@ -25,8 +26,9 @@ class PluginRunnerClient:
         self._secret = secret
         self._timeout = timeout
         self._transport = transport
-        #: Captured from enrollment; used to verify API-to-runner push signatures.
-        self.push_signing_secret = ""
+        #: Captured from enrollment (or seeded here when resuming from persisted
+        #: state); used to verify API-to-runner push signatures.
+        self.push_signing_secret = push_signing_secret
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._secret}"}

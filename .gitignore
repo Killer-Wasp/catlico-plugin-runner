@@ -3,3 +3,12 @@
 __pycache__/
 *.py[cod]
 
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Persisted runner credentials (bearer secrets) — never commit
+.runner-state.json
+.runner-state.json.tmp

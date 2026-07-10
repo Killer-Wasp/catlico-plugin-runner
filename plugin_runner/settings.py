@@ -16,7 +16,14 @@ class RunnerSettings(BaseSettings):
     catlico_api_url: str = "http://localhost:8000"
 
     #: One-time enrollment token, issued by Catlico when the runner is registered.
+    #: Only consulted when there is no usable persisted credential (first start,
+    #: or recovery after the API rejects a stale credential). See ``state_file``.
     enrollment_token: str = ""
+
+    #: Where the machine credential and push-signing secret from enrollment are
+    #: cached so restarts resume instead of re-spending the one-time token. Holds
+    #: bearer secrets: created 0600 and written atomically. Must be gitignored.
+    state_file: str = ".runner-state.json"
 
     #: Directories scanned for locally-provisioned plugins (Docker volume mounts).
     plugin_dirs: list[str] = []

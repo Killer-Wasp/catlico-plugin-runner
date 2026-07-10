@@ -5,6 +5,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
+import httpx
 import uvicorn
 
 from plugin_runner.client import PluginRunnerClient
@@ -13,6 +14,7 @@ from plugin_runner.registry import discover
 from plugin_runner.sandbox import ContainerSandboxRunner, SandboxRunner, SubprocessSandboxRunner
 from plugin_runner.server import create_app
 from plugin_runner.settings import RunnerSettings, load_settings
+from plugin_runner.state import RunnerState, load_state, save_state
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +134,82 @@ def _register_body(settings: RunnerSettings, registry) -> dict:
     }
 
 
+class EnrollmentRequired(RuntimeError):
+    """No usable persisted credential and no enrollment token to obtain one.
+
+    Raised instead of re-attempting enrollment with a spent token or booting
+    with a dead credential — the message tells an operator how to recover.
+    """
+
+
+async def _enroll(settings: RunnerSettings, registry) -> PluginRunnerClient:
+    """Spend the one-time enrollment token and persist the returned secrets.
+
+    Refuses (loudly) when no token is configured: there is nothing to enroll
+    with, and silently continuing would only fail later, per-call."""
+    if not settings.enrollment_token:
+        raise EnrollmentRequired(
+            f"runner {settings.runner_id!r} has no usable credential at "
+            f"{settings.state_file!r} and no PLUGIN_RUNNER_ENROLLMENT_TOKEN is "
+            "set. Mint a fresh enrollment token for this runner in Catlico and "
+            "provide it via PLUGIN_RUNNER_ENROLLMENT_TOKEN, then restart."
+        )
+    client = PluginRunnerClient(settings.catlico_api_url, timeout=settings.http_timeout)
+    resp = await client.enroll(_register_body(settings, registry))
+    # Persist before serving so a restart resumes instead of re-spending the
+    # (now consumed) token. Never log the returned secrets.
+    save_state(
+        settings.state_file,
+        RunnerState(
+            credential=resp["runner_credential"],
+            push_signing_secret=resp.get("push_signing_secret", ""),
+        ),
+    )
+    logger.info("enrolled runner %s (credentials persisted)", settings.runner_id)
+    return client
+
+
+async def bootstrap_client(settings: RunnerSettings, registry) -> PluginRunnerClient:
+    """Return an authenticated client, resuming from persisted state when possible.
+
+    Precedence: a persisted credential wins over the enrollment token, so a
+    restart does not re-spend the one-time token. But the saved credential is
+    validated against the API first (a cheap ``/sync``). If the API *rejects* it
+    (401/403 — exactly what happens once an admin resets the runner to
+    ``pending`` and mints a fresh token), the saved credential is dead, so we
+    fall back to enrolling with the token. This gives operators a
+    recovery path (reset the runner + supply a fresh token) without having to
+    hand-delete the state file.
+
+    A transient failure (5xx, connection error) is *not* proof the credential is
+    dead and the credential cannot be re-minted, so it is propagated rather than
+    discarding the saved state.
+    """
+    state = load_state(settings.state_file)
+    if state is None or not state.is_usable():
+        return await _enroll(settings, registry)
+
+    client = PluginRunnerClient(
+        settings.catlico_api_url,
+        secret=state.credential,
+        push_signing_secret=state.push_signing_secret,
+        timeout=settings.http_timeout,
+    )
+    try:
+        await client.sync()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code not in (401, 403):
+            raise
+        logger.warning(
+            "persisted credential for runner %s was rejected (%s); re-enrolling",
+            settings.runner_id,
+            exc.response.status_code,
+        )
+        return await _enroll(settings, registry)
+    logger.info("resumed runner %s from persisted credential", settings.runner_id)
+    return client
+
+
 async def _heartbeat_loop(
     client: PluginRunnerClient, settings: RunnerSettings, registry
 ) -> None:
@@ -169,9 +247,11 @@ async def serve(
     await _verify_container_runtime(sandbox, runtime_check)
     await _ensure_plugin_images(sandbox, registry)
 
-    client = PluginRunnerClient(settings.catlico_api_url, timeout=settings.http_timeout)
-    await client.enroll(_register_body(settings, registry))
-    logger.info("enrolled runner %s", settings.runner_id)
+    # Resume from persisted credentials when available; only enroll (spending
+    # the one-time token) when there is no usable saved state. Runs *after* the
+    # container-runtime preflight above: a runner with no usable runtime must
+    # never enroll/resume and register as healthy.
+    client = await bootstrap_client(settings, registry)
 
     app = create_app(
         client=client,

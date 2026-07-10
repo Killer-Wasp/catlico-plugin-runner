@@ -85,6 +85,10 @@ class _FakeClient:
 
     async def enroll(self, body):
         self.enroll_called = True
+        return {"runner_credential": "cpr_fake", "push_signing_secret": "cps_fake"}
+
+    async def sync(self):
+        return {}
 
     async def heartbeat(self, body):
         pass
@@ -107,8 +111,15 @@ def _stub_serve(monkeypatch):
     return _FakeClient
 
 
-async def test_serve_refuses_to_start_when_runtime_unavailable(_stub_serve):
-    settings = RunnerSettings(isolation_mode="container", plugin_dirs=[])
+async def test_serve_refuses_to_start_when_runtime_unavailable(_stub_serve, tmp_path):
+    # state_file under tmp_path (nonexistent) so bootstrap would take the enroll
+    # path — but the preflight must abort before that. No real state file.
+    settings = RunnerSettings(
+        isolation_mode="container",
+        plugin_dirs=[],
+        enrollment_token="tok",
+        state_file=str(tmp_path / "state.json"),
+    )
     with pytest.raises(main.ContainerRuntimeUnavailable):
         await main.serve(settings, runtime_check=_down)
     # Refuse means we never enroll — the runner must not register as healthy
@@ -116,7 +127,14 @@ async def test_serve_refuses_to_start_when_runtime_unavailable(_stub_serve):
     assert all(not c.enroll_called for c in _stub_serve.instances)
 
 
-async def test_serve_proceeds_when_runtime_available(_stub_serve):
-    settings = RunnerSettings(isolation_mode="container", plugin_dirs=[])
+async def test_serve_proceeds_when_runtime_available(_stub_serve, tmp_path):
+    # No saved state → bootstrap enrolls with the token. state_file lives under
+    # tmp_path so the persisted credential never lands in the repo.
+    settings = RunnerSettings(
+        isolation_mode="container",
+        plugin_dirs=[],
+        enrollment_token="tok",
+        state_file=str(tmp_path / "state.json"),
+    )
     await main.serve(settings, runtime_check=_up)
     assert any(c.enroll_called for c in _stub_serve.instances)
