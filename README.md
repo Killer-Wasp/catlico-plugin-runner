@@ -99,19 +99,31 @@ authenticated — the private network is the only control on them.
 
 The active adapter is chosen by `PLUGIN_RUNNER_ISOLATION_MODE`:
 
-- **`subprocess` (`SubprocessSandboxRunner`) — the current default.** Trusted-mode
-  dev adapter. Each run executes `python -m catlico_plugin_sdk._worker` in its
-  own process **group** (`start_new_session=True`); on timeout the whole group
-  is `SIGKILL`ed. The plugin runs on the host with the runner's own
-  privileges — use only for plugins you trust.
-- **`container` (any value other than `subprocess`) (`ContainerSandboxRunner`).**
-  Untrusted-mode adapter. Each run is a single-use container built for that
-  plugin. The runtime is hardcoded to `docker` and the network to `bridge`
-  (neither is configurable via settings today).
+- **`container` (`ContainerSandboxRunner`) — the default.** Untrusted-mode
+  adapter for third-party plugins. Each run is a single-use, hardened container
+  built for that plugin. The runtime is hardcoded to `docker` and the network to
+  `bridge` (neither is configurable via settings today). Requires a working
+  container runtime; the per-plugin images are built at startup from
+  `PLUGIN_RUNNER_PLUGIN_DIRS` (see [Install pipeline](#install-pipeline)).
+- **`subprocess` (`SubprocessSandboxRunner`) — explicit opt-in, trusted local
+  development only.** Each run executes `python -m catlico_plugin_sdk._worker` in
+  its own process **group** (`start_new_session=True`); on timeout the whole
+  group is `SIGKILL`ed. The plugin runs on the host with the runner's own
+  privileges — **no container, read-only rootfs, resource caps or capability
+  drops, i.e. no isolation.** Use only for plugins you trust.
 
-> Note: the module docstrings describe `container` as "the default for untrusted
-> plugins," but the shipped default in `settings.py` is `subprocess`. Set
-> `PLUGIN_RUNNER_ISOLATION_MODE=container` to get container isolation.
+Any other value (e.g. a typo like `contianer`) is rejected at startup with an
+error naming the valid modes — the runner never silently falls back to an
+adapter you did not ask for.
+
+> **Container-runtime preflight.** Because container is the default, a host with
+> no working container runtime would go from "runs plugins" to "fails every
+> run". At startup, when container isolation is selected, the runner verifies the
+> runtime is usable (a `docker version` preflight). If it is not, the runner logs
+> a prominent, actionable error and **refuses to start** rather than enroll,
+> report healthy, and then fail every claimed run. The error names the explicit
+> opt-out (`PLUGIN_RUNNER_ISOLATION_MODE=subprocess`, which disables isolation
+> and is for trusted local development only).
 
 ### Container hardening
 
@@ -191,7 +203,7 @@ All settings use the `PLUGIN_RUNNER_` env prefix (see `settings.py`).
 | `PLUGIN_RUNNER_CATLICO_API_URL` | `http://localhost:8000` | Catlico API base URL (control plane) |
 | `PLUGIN_RUNNER_ENROLLMENT_TOKEN` | `""` | One-time enrollment token from the admin |
 | `PLUGIN_RUNNER_PLUGIN_DIRS` | `[]` | Directories scanned for provisioned plugins (JSON list) |
-| `PLUGIN_RUNNER_ISOLATION_MODE` | `subprocess` | `subprocess` (trusted) or `container` (untrusted) |
+| `PLUGIN_RUNNER_ISOLATION_MODE` | `container` | `container` (untrusted, default; needs a working container runtime) or `subprocess` (trusted local dev, no isolation). Any other value is rejected at startup |
 | `PLUGIN_RUNNER_HOST` | `0.0.0.0` | Private API bind host |
 | `PLUGIN_RUNNER_PORT` | `8090` | Private API bind port |
 | `PLUGIN_RUNNER_HEARTBEAT_INTERVAL_SECONDS` | `30` | Heartbeat cadence to the API |

@@ -21,9 +21,14 @@ class RunnerSettings(BaseSettings):
     #: Directories scanned for locally-provisioned plugins (Docker volume mounts).
     plugin_dirs: list[str] = []
 
-    #: Default execution isolation. ``subprocess`` is trusted-mode; ``container``
-    #: is the untrusted default (adapter selected by the runner).
-    isolation_mode: str = "subprocess"
+    #: Execution isolation mode (adapter selected by ``main.select_sandbox``).
+    #: ``container`` (the default) runs each untrusted third-party plugin in a
+    #: throwaway, hardened container — this is the safe default. ``subprocess``
+    #: is an explicit opt-in for trusted local development only: it runs plugins
+    #: as child processes on the host with no container, no read-only rootfs, no
+    #: resource caps and no capability drops — no isolation. Any other value is
+    #: rejected at startup (see ``select_sandbox``).
+    isolation_mode: str = "container"
 
     #: Private HTTP server bind.
     host: str = "0.0.0.0"
