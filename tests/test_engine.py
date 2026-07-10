@@ -118,3 +118,72 @@ async def test_plugin_actor_event_is_suppressed():
     )
     assert summary["suppressed"] is True
     assert client.calls == []
+
+
+# --- Targeted (manual) dispatch ---
+
+
+def _second_plugin() -> InstalledPlugin:
+    return InstalledPlugin(
+        id="other", version="1.0.0",
+        manifest={"triggers": ["case.created"], "permissions": [], "timeout_seconds": 30},
+        module="other.plugin", cls="Plugin", path="/plugins/other/src",
+    )
+
+
+async def test_target_plugin_id_runs_only_that_plugin_bypassing_triggers():
+    """A manual run targets one plugin and runs it even when the plugin's
+    declared triggers do not cover the event type."""
+    client = FakeClient("created")
+    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
+    registry = _registry()
+    registry.add(_second_plugin())
+    envelope = {
+        **_ENVELOPE,
+        "event_type": "observable.manual",  # NOT in acme's triggers
+        "target_plugin_id": "acme",
+    }
+    summary = await dispatch_event(
+        envelope, client, registry, sandbox,
+        runner_id="runner-1", api_base_url="http://c",
+    )
+    assert summary["outcomes"] == {"acme": "success"}
+    assert client.calls == ["claim", "accept", "config", "start", "result:success"]
+
+
+async def test_unknown_target_plugin_is_clean_noop():
+    client = FakeClient("created")
+    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
+    envelope = {**_ENVELOPE, "target_plugin_id": "does-not-exist"}
+    summary = await dispatch_event(
+        envelope, client, _registry(), sandbox,
+        runner_id="runner-1", api_base_url="http://c",
+    )
+    assert summary == {"dispatched": 0, "suppressed": False, "outcomes": {}}
+    assert client.calls == []
+    assert sandbox.requests == []
+
+
+async def test_absent_target_keeps_trigger_fanout():
+    """No target -> unchanged behaviour: only trigger matches run, not everything."""
+    client = FakeClient("created")
+    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
+    registry = _registry()
+    registry.add(_second_plugin())  # triggers on case.created, must NOT run
+    summary = await dispatch_event(
+        _ENVELOPE, client, registry, sandbox,
+        runner_id="runner-1", api_base_url="http://c",
+    )
+    assert set(summary["outcomes"]) == {"acme"}
+
+
+async def test_targeted_envelope_still_suppresses_plugin_actor():
+    client = FakeClient("created")
+    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
+    envelope = {**_ENVELOPE, "target_plugin_id": "acme", "actor": "plugin:acme@1.0.0"}
+    summary = await dispatch_event(
+        envelope, client, _registry(), sandbox,
+        runner_id="runner-1", api_base_url="http://c",
+    )
+    assert summary["suppressed"] is True
+    assert client.calls == []

@@ -95,15 +95,31 @@ async def dispatch_event(
     runner_id: str,
     api_base_url: str,
 ) -> dict:
-    """Distribute one event to every locally-installed plugin that wants it."""
+    """Distribute one event to installed plugins.
+
+    Normally the event fans out to every locally-installed plugin whose triggers
+    match. A ``target_plugin_id`` (set by a manual run) overrides that: run only
+    that one plugin and bypass trigger matching entirely — analyst intent wins,
+    even when the plugin's declared triggers don't cover the entity event. An
+    unknown target is a clean no-op.
+    """
     actor = envelope.get("actor", "")
     if isinstance(actor, str) and actor.startswith("plugin:"):
         # Loop prevention (defense in depth; the API also suppresses these).
         return {"dispatched": 0, "suppressed": True, "outcomes": {}}
 
-    event_type = envelope.get("event_type", "")
+    target_plugin_id = envelope.get("target_plugin_id")
+    if target_plugin_id:
+        targeted = next(
+            (p for p in registry.all() if p.id == target_plugin_id), None
+        )
+        plugins = [targeted] if targeted is not None else []
+    else:
+        event_type = envelope.get("event_type", "")
+        plugins = registry.for_trigger(event_type)
+
     outcomes: dict[str, str] = {}
-    for plugin in registry.for_trigger(event_type):
+    for plugin in plugins:
         try:
             outcomes[plugin.id] = await _run_one(
                 plugin, envelope, client, sandbox,
