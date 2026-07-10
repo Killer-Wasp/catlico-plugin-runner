@@ -56,7 +56,7 @@ def create_app(
                 "status": "healthy",
                 "runner_id": runner_id,
                 "installed_plugin_count": len(registry.all()),
-                "isolation_mode": "subprocess",
+                "isolation_mode": getattr(sandbox, "isolation_mode", "subprocess"),
             }
         )
 

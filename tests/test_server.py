@@ -4,7 +4,11 @@ import json
 from starlette.testclient import TestClient
 
 from plugin_runner.registry import InstalledPlugin, Registry
-from plugin_runner.sandbox import SandboxRunResult
+from plugin_runner.sandbox import (
+    ContainerSandboxRunner,
+    SandboxRunResult,
+    SubprocessSandboxRunner,
+)
 from plugin_runner.server import create_app, sign_body
 
 PUSH_SECRET = "push-secret"
@@ -52,11 +56,47 @@ def _app():
     )
 
 
+def _app_with_sandbox(sandbox):
+    return create_app(
+        client=_FakeClient(),
+        registry=_registry(),
+        runner_id="runner-1",
+        api_base_url="http://catlico:8000",
+        sandbox=sandbox,
+    )
+
+
 def test_health():
     client = TestClient(_app())
     r = client.get("/internal/health")
     assert r.status_code == 200
     assert r.json()["installed_plugin_count"] == 1
+
+
+def test_health_reports_subprocess_mode():
+    client = TestClient(_app_with_sandbox(SubprocessSandboxRunner()))
+    r = client.get("/internal/health")
+    assert r.json()["isolation_mode"] == "subprocess"
+
+
+def test_health_reports_container_mode():
+    client = TestClient(_app_with_sandbox(ContainerSandboxRunner()))
+    r = client.get("/internal/health")
+    assert r.json()["isolation_mode"] == "container"
+
+
+def test_health_defaults_to_subprocess_when_unset():
+    # create_app defaults to the subprocess adapter when none is passed.
+    client = TestClient(
+        create_app(
+            client=_FakeClient(),
+            registry=_registry(),
+            runner_id="runner-1",
+            api_base_url="http://catlico:8000",
+        )
+    )
+    r = client.get("/internal/health")
+    assert r.json()["isolation_mode"] == "subprocess"
 
 
 def test_plugins_lists_manifests():

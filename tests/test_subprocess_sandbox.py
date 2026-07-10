@@ -138,3 +138,128 @@ async def test_timeout_kills_process(tmp_path):
     )
     assert result.status == "timeout"
     assert result.error_kind == "timeout"
+
+
+# --- Secret redaction in the log tail (real subprocess, every terminal path) ---
+
+SECRET = "supersecretapikey-abc123XYZ"
+TOKEN = "bearer-token-9f8e7d6c5b4a"
+
+_LEAK_TO_BOTH_STREAMS = """
+import sys
+from catlico_plugin_sdk import CatlicoPlugin
+
+class Plugin(CatlicoPlugin):
+    async def should_process(self, event, ctx):
+        return True
+
+    async def process(self, event, ctx):
+        print("stdout leak: %s", flush=True)
+        print("stderr leak: %s", file=sys.stderr, flush=True)
+        {tail}
+"""
+
+
+def _leak_plugin(tmp_path, tail: str) -> str:
+    return _write_plugin(
+        tmp_path,
+        _LEAK_TO_BOTH_STREAMS.format(secret=SECRET, tail=tail).replace("%s", SECRET),
+    )
+
+
+async def test_secret_redacted_on_success(tmp_path):
+    plugin_path = _leak_plugin(tmp_path, "pass")
+    result = await SubprocessSandboxRunner().run(
+        _request(plugin_path, secrets={"api_key": SECRET})
+    )
+    assert result.status == "success", result.error
+    assert SECRET not in (result.log_tail or "")
+    assert "***REDACTED***" in (result.log_tail or "")
+
+
+async def test_secret_redacted_on_failure(tmp_path):
+    plugin_path = _leak_plugin(tmp_path, "raise ValueError('boom')")
+    result = await SubprocessSandboxRunner().run(
+        _request(plugin_path, secrets={"api_key": SECRET})
+    )
+    assert result.status == "failure"
+    assert SECRET not in (result.log_tail or "")
+    assert "***REDACTED***" in (result.log_tail or "")  # leak captured + masked
+
+
+async def test_secret_redacted_on_timeout(tmp_path):
+    # The runner's drain-after-kill is best-effort, so the timeout log tail may
+    # be empty; either way the contract holds: the secret must never appear.
+    plugin_path = _leak_plugin(
+        tmp_path, "import asyncio\n        await asyncio.sleep(30)"
+    )
+    result = await SubprocessSandboxRunner().run(
+        _request(plugin_path, timeout_seconds=1, secrets={"api_key": SECRET})
+    )
+    assert result.status == "timeout"
+    assert SECRET not in (result.log_tail or "")
+
+
+async def test_run_token_redacted(tmp_path):
+    plugin_path = _write_plugin(
+        tmp_path,
+        f"""
+        from catlico_plugin_sdk import CatlicoPlugin
+
+        class Plugin(CatlicoPlugin):
+            async def should_process(self, event, ctx):
+                return True
+
+            async def process(self, event, ctx):
+                print("token is {TOKEN}", flush=True)
+        """,
+    )
+    result = await SubprocessSandboxRunner().run(
+        _request(plugin_path, run_token=TOKEN)
+    )
+    assert result.status == "success", result.error
+    assert TOKEN not in (result.log_tail or "")
+    assert "***REDACTED***" in (result.log_tail or "")
+
+
+async def test_short_and_empty_secrets_do_not_corrupt_log(tmp_path):
+    plugin_path = _write_plugin(
+        tmp_path,
+        """
+        from catlico_plugin_sdk import CatlicoPlugin
+
+        class Plugin(CatlicoPlugin):
+            async def should_process(self, event, ctx):
+                return True
+
+            async def process(self, event, ctx):
+                print("processed 1 item ok=true count=0 done", flush=True)
+        """,
+    )
+    result = await SubprocessSandboxRunner().run(
+        _request(plugin_path, secrets={"a": "", "b": "1", "c": "true"})
+    )
+    assert result.status == "success", result.error
+    assert "***REDACTED***" not in (result.log_tail or "")
+    assert "processed 1 item ok=true count=0 done" in (result.log_tail or "")
+
+
+async def test_non_string_secret_does_not_crash(tmp_path):
+    plugin_path = _write_plugin(
+        tmp_path,
+        """
+        from catlico_plugin_sdk import CatlicoPlugin
+
+        class Plugin(CatlicoPlugin):
+            async def should_process(self, event, ctx):
+                return True
+
+            async def process(self, event, ctx):
+                print("numeric secret 987654 flag True", flush=True)
+        """,
+    )
+    result = await SubprocessSandboxRunner().run(
+        _request(plugin_path, secrets={"num": 987654, "flag": True})
+    )
+    assert result.status == "success", result.error
+    assert "987654" not in (result.log_tail or "")  # coerced + long enough

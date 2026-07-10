@@ -25,6 +25,16 @@ from pathlib import Path
 #: Maximum captured stdout/stderr retained on the result (bytes).
 LOG_TAIL_MAX_BYTES = 64 * 1024
 
+#: Stable placeholder written in place of a secret in a captured log tail.
+REDACTION_MARKER = "***REDACTED***"
+
+#: Minimum length a secret value must have before we redact it. Values shorter
+#: than this (e.g. ``""``, ``"1"``, ``"0"``, ``"true"``) are too generic: they
+#: occur incidentally throughout normal log output, so redacting them would
+#: corrupt or blank the log without protecting a real credential. Real API keys,
+#: bearer tokens and run tokens are always comfortably longer than this.
+MIN_SECRET_LEN = 5
+
 
 @dataclass
 class SandboxRunRequest:
@@ -64,12 +74,58 @@ class SandboxRunResult:
 class SandboxRunner:
     """Executes plugin runs in isolated environments (subclass interface)."""
 
+    #: Isolation mode this adapter provides. Overridden by each concrete adapter
+    #: so callers (e.g. the health endpoint) can report the mode actually in
+    #: effect rather than a hardcoded guess.
+    isolation_mode: str = "subprocess"
+
     async def run(self, request: SandboxRunRequest) -> SandboxRunResult:  # pragma: no cover
         raise NotImplementedError
 
 
 def _tail(data: bytes, limit: int = LOG_TAIL_MAX_BYTES) -> str:
     return data[-limit:].decode("utf-8", errors="replace")
+
+
+def _redact(text: str, secrets: dict | None, run_token: str = "") -> str:
+    """Replace every secret value (and the run token) found in ``text`` with a
+    stable marker.
+
+    Non-string secret values (ints, bools) are coerced with ``str(...)`` so the
+    redactor never crashes on them; they are matched against the printed form a
+    plugin would actually emit. Values shorter than ``MIN_SECRET_LEN`` are
+    skipped (see that constant). Longer values are replaced first so a secret
+    that contains a shorter secret as a substring is fully masked.
+    """
+    candidates: set[str] = set()
+    values = list((secrets or {}).values())
+    if run_token:
+        values.append(run_token)
+    for raw in values:
+        value = raw if isinstance(raw, str) else str(raw)
+        if len(value) >= MIN_SECRET_LEN:
+            candidates.add(value)
+    for value in sorted(candidates, key=len, reverse=True):
+        text = text.replace(value, REDACTION_MARKER)
+    return text
+
+
+def _log_tail(
+    data: bytes,
+    secrets: dict | None = None,
+    run_token: str = "",
+    limit: int = LOG_TAIL_MAX_BYTES,
+) -> str:
+    """Produce the bounded, secret-redacted log tail for a run.
+
+    Order is redact-then-tail: we redact the *full* decoded output before
+    truncating to the last ``limit`` bytes. Tailing first would let a secret
+    straddling the truncation boundary survive as a partial (unmatched) string
+    and leak; redacting first guarantees no whole secret can reach the tail.
+    The final byte-slice preserves the existing 64KB cap semantics.
+    """
+    text = _redact(data.decode("utf-8", errors="replace"), secrets, run_token)
+    return _tail(text.encode("utf-8", errors="replace"), limit)
 
 
 class SubprocessSandboxRunner(SandboxRunner):
@@ -79,6 +135,8 @@ class SubprocessSandboxRunner(SandboxRunner):
     process group; on timeout the whole group is killed. The plugin is never
     imported into this runner process.
     """
+
+    isolation_mode = "subprocess"
 
     def __init__(self, python_executable: str | None = None):
         self._python = python_executable or sys.executable
@@ -123,10 +181,10 @@ class SubprocessSandboxRunner(SandboxRunner):
                     status="timeout",
                     error=f"timed out after {request.timeout_seconds}s",
                     error_kind="timeout",
-                    log_tail=_tail(stdout),
+                    log_tail=_log_tail(stdout, request.secrets, request.run_token),
                 )
 
-            log_tail = _tail(stdout or b"")
+            log_tail = _log_tail(stdout or b"", request.secrets, request.run_token)
             result = self._read_result(result_path)
             if result is None:
                 return SandboxRunResult(
@@ -231,6 +289,8 @@ class ContainerSandboxRunner(SandboxRunner):
     an isolated container killed on timeout.
     """
 
+    isolation_mode = "container"
+
     def __init__(self, runtime: str = "docker", network: str = "bridge"):
         self._runtime = runtime
         self._network = network
@@ -279,7 +339,8 @@ class ContainerSandboxRunner(SandboxRunner):
             return SandboxRunResult(
                 run_id=request.run_id, status="timeout",
                 error=f"timed out after {request.timeout_seconds}s",
-                error_kind="timeout", log_tail=_tail(stdout),
+                error_kind="timeout",
+                log_tail=_log_tail(stdout, request.secrets, request.run_token),
             )
 
         result, logs = parse_sentinel_result(stdout or b"")
@@ -287,7 +348,7 @@ class ContainerSandboxRunner(SandboxRunner):
             return SandboxRunResult(
                 run_id=request.run_id, status="failure",
                 error="container produced no result", error_kind="bug",
-                log_tail=_tail(logs.encode()),
+                log_tail=_log_tail(logs.encode(), request.secrets, request.run_token),
             )
         return SandboxRunResult(
             run_id=request.run_id,
@@ -297,7 +358,7 @@ class ContainerSandboxRunner(SandboxRunner):
             skip_reason=result.get("skip_reason"),
             result_summary=result.get("result_summary"),
             operation_count=result.get("operation_count", 0),
-            log_tail=_tail(logs.encode()),
+            log_tail=_log_tail(logs.encode(), request.secrets, request.run_token),
         )
 
     async def _kill_container(self, name: str) -> None:
