@@ -104,7 +104,9 @@ async def _verify_container_runtime(
     )
 
 
-async def _ensure_plugin_images(sandbox: SandboxRunner, registry) -> None:
+async def _ensure_plugin_images(
+    sandbox: SandboxRunner, registry, *, sdk_source: str = ""
+) -> None:
     """Build any per-plugin container images the active adapter needs before we
     start serving. Keyed off the adapter itself (not ``settings.isolation_mode``)
     so this keeps working when the isolation default flips: only the container
@@ -113,7 +115,7 @@ async def _ensure_plugin_images(sandbox: SandboxRunner, registry) -> None:
     if not isinstance(sandbox, ContainerSandboxRunner):
         return
     runtime = getattr(sandbox, "_runtime", "docker")
-    states = await ensure_images(registry.all(), runtime=runtime)
+    states = await ensure_images(registry.all(), runtime=runtime, sdk_source=sdk_source)
     unavailable = sorted(pid for pid, state in states.items() if state != STATE_INSTALLED)
     if unavailable:
         logger.warning(
@@ -245,7 +247,7 @@ async def serve(
     # Preflight before we enroll or build anything: if container isolation can't
     # work, refuse to start rather than register as healthy and fail every run.
     await _verify_container_runtime(sandbox, runtime_check)
-    await _ensure_plugin_images(sandbox, registry)
+    await _ensure_plugin_images(sandbox, registry, sdk_source=settings.sdk_source)
 
     # Resume from persisted credentials when available; only enroll (spending
     # the one-time token) when there is no usable saved state. Runs *after* the

@@ -31,6 +31,12 @@ class PluginRunnerClient:
         self.push_signing_secret = push_signing_secret
 
     def _headers(self) -> dict[str, str]:
+        # During enrollment there is no credential yet: /register authenticates on
+        # the enrollment_token in the body, not a Bearer header. Emitting an empty
+        # "Bearer " value makes httpx reject the request locally (illegal header),
+        # so send no Authorization header until a secret exists.
+        if not self._secret:
+            return {}
         return {"Authorization": f"Bearer {self._secret}"}
 
     def _url(self, path: str) -> str:

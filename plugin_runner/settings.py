@@ -28,6 +28,14 @@ class RunnerSettings(BaseSettings):
     #: Directories scanned for locally-provisioned plugins (Docker volume mounts).
     plugin_dirs: list[str] = []
 
+    #: Local checkout of ``catlico-plugin-sdk`` to bake into each plugin image.
+    #: Needed for local dev, where the SDK is an unpublished sibling checkout that
+    #: lives *outside* a plugin's Docker build context — the install pipeline
+    #: stages it into the context so the image can ``pip install`` it. Empty
+    #: (default) installs the published ``catlico-plugin-sdk`` from PyPI, which is
+    #: the production path.
+    sdk_source: str = ""
+
     #: Execution isolation mode (adapter selected by ``main.select_sandbox``).
     #: ``container`` (the default) runs each untrusted third-party plugin in a
     #: throwaway, hardened container — this is the safe default. ``subprocess``

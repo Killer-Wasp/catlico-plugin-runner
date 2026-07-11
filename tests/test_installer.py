@@ -6,6 +6,8 @@ from pathlib import Path
 from plugin_runner.installer import (
     STATE_FAILED,
     STATE_INSTALLED,
+    _stage_sdk,
+    _unstage_sdk,
     generate_dockerfile,
     has_lockfile,
     image_tag,
@@ -51,7 +53,46 @@ def test_generate_dockerfile_is_non_root_and_installs_sdk():
     assert "USER 65534:65534" in dockerfile
     assert "pip install --no-cache-dir catlico-plugin-sdk" in dockerfile
     assert "ENTRYPOINT" not in dockerfile  # sandbox sets the command
-    assert "python:3.12-slim" in dockerfile
+    assert "python:3.14-slim" in dockerfile  # SDK/plugins require-python >=3.14
+
+
+def test_generate_dockerfile_installs_staged_sdk():
+    plugin = InstalledPlugin(
+        id="acme", version="1.0.0", manifest=_GOOD,
+        module="acme.plugin", cls="Plugin", path="/p/src",
+    )
+    dockerfile = generate_dockerfile(plugin, sdk_dir=".catlico-sdk")
+    # Installs from the staged copy, not PyPI, and removes it from the image.
+    assert "pip install --no-cache-dir catlico-plugin-sdk" not in dockerfile
+    assert "pip install --no-cache-dir /plugin/.catlico-sdk" in dockerfile
+    assert "rm -rf /plugin/.catlico-sdk" in dockerfile
+
+
+def test_stage_sdk_copies_checkout_and_unstage_removes_it(tmp_path):
+    sdk = tmp_path / "sdk"
+    (sdk / "catlico_plugin_sdk").mkdir(parents=True)
+    (sdk / "pyproject.toml").write_text("[project]\nname='catlico-plugin-sdk'\n")
+    (sdk / ".venv").mkdir()  # excluded by the copy-ignore patterns
+    context = tmp_path / "acme"
+    context.mkdir()
+
+    staged = _stage_sdk(context, str(sdk))
+    assert staged == ".catlico-sdk"
+    assert (context / ".catlico-sdk" / "pyproject.toml").is_file()
+    assert not (context / ".catlico-sdk" / ".venv").exists()
+
+    _unstage_sdk(context)
+    assert not (context / ".catlico-sdk").exists()
+
+
+def test_stage_sdk_none_when_unset_or_invalid(tmp_path):
+    context = tmp_path / "acme"
+    context.mkdir()
+    assert _stage_sdk(context, "") is None
+    # A path without a pyproject.toml is not a usable checkout -> fall back to PyPI.
+    (tmp_path / "notsdk").mkdir()
+    assert _stage_sdk(context, str(tmp_path / "notsdk")) is None
+    assert not (context / ".catlico-sdk").exists()
 
 
 def test_has_lockfile(tmp_path):

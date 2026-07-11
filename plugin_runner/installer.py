@@ -9,12 +9,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from plugin_runner.registry import InstalledPlugin, load_plugin
 
 logger = logging.getLogger(__name__)
+
+#: Name of the SDK copy staged inside a plugin's build context (see _stage_sdk).
+_SDK_STAGE_DIRNAME = ".catlico-sdk"
+#: Heavy/irrelevant trees excluded when copying the local SDK checkout.
+_SDK_COPY_IGNORE = shutil.ignore_patterns(
+    ".venv", "venv", "__pycache__", "*.pyc", ".git", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", "dist", "build", "*.egg-info",
+)
 
 # Ordered install states surfaced to the web UI (via PluginVersion.status).
 STATE_CLONING = "cloning"
@@ -69,22 +78,67 @@ def image_tag(plugin_id: str, version: str) -> str:
     return f"catlico-plugin/{plugin_id}:{version}"
 
 
-def generate_dockerfile(plugin: InstalledPlugin) -> str:
-    """A non-root, dependency-pinned image that runs the shared SDK worker."""
+def generate_dockerfile(plugin: InstalledPlugin, *, sdk_dir: str = "") -> str:
+    """A non-root, dependency-pinned image that runs the shared SDK worker.
+
+    ``sdk_dir`` is the build-context-relative directory holding a staged local
+    SDK checkout (see ``_stage_sdk``). When set, the SDK is installed from that
+    copy and removed from the image afterwards; when empty, the published
+    ``catlico-plugin-sdk`` is pulled from PyPI (the production path).
+    """
+    if sdk_dir:
+        install_sdk = (
+            f"RUN pip install --no-cache-dir /plugin/{sdk_dir} && rm -rf /plugin/{sdk_dir}\n"
+        )
+    else:
+        install_sdk = "RUN pip install --no-cache-dir catlico-plugin-sdk\n"
     install_deps = (
         "RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi\n"
     )
     return (
-        "FROM python:3.12-slim\n"
+        # 3.14+: the SDK and plugins declare requires-python >=3.14 (matches the
+        # workspace toolchain); an older base fails `pip install` on that marker.
+        "FROM python:3.14-slim\n"
         "RUN useradd --uid 65534 --no-create-home nobodyplugin || true\n"
         "WORKDIR /plugin\n"
         "COPY . /plugin\n"
-        "RUN pip install --no-cache-dir catlico-plugin-sdk\n"
+        f"{install_sdk}"
         f"{install_deps}"
         "ENV PYTHONPATH=/plugin/src:/plugin\n"
         "USER 65534:65534\n"
         # No ENTRYPOINT: the sandbox sets `python -m catlico_plugin_sdk._worker`.
     )
+
+
+def _stage_sdk(context: Path, sdk_source: str) -> str | None:
+    """Copy a local SDK checkout into the plugin's build context.
+
+    Docker can only ``COPY`` from inside the build context, but the local SDK is
+    a sibling checkout outside it. Copy it to ``<context>/.catlico-sdk`` so the
+    generated Dockerfile can install it, and return that context-relative name.
+    Returns ``None`` (image falls back to the PyPI SDK) when no source is
+    configured or the path is not a valid checkout. Always paired with a
+    ``_unstage_sdk`` in a ``finally``.
+    """
+    if not sdk_source:
+        return None
+    src = Path(sdk_source).expanduser()
+    if not (src / "pyproject.toml").is_file():
+        logger.warning(
+            "PLUGIN_RUNNER_SDK_SOURCE=%s is not an SDK checkout (no pyproject.toml); "
+            "falling back to the PyPI SDK",
+            sdk_source,
+        )
+        return None
+    dest = context / _SDK_STAGE_DIRNAME
+    _unstage_sdk(context)  # clear any stale copy from an interrupted build
+    shutil.copytree(src, dest, ignore=_SDK_COPY_IGNORE)
+    return _SDK_STAGE_DIRNAME
+
+
+def _unstage_sdk(context: Path) -> None:
+    """Remove a staged SDK copy; no-op if absent."""
+    shutil.rmtree(context / _SDK_STAGE_DIRNAME, ignore_errors=True)
 
 
 async def build_image(
@@ -107,6 +161,7 @@ async def install_local(
     strict: bool = False,
     runtime: str = "docker",
     build: bool = True,
+    sdk_source: str = "",
     on_state=None,
 ) -> InstallResult:
     """Run the pipeline for a plugin directory. ``on_state(state)`` is called at
@@ -135,9 +190,15 @@ async def install_local(
 
     tag = image_tag(plugin.id, plugin.version)
     if build:
-        (directory / "Dockerfile.catlico").write_text(generate_dockerfile(plugin))
-        await _emit(STATE_BUILDING)
-        ok, log = await build_image(directory, tag, runtime=runtime)
+        sdk_dir = _stage_sdk(directory, sdk_source)
+        try:
+            (directory / "Dockerfile.catlico").write_text(
+                generate_dockerfile(plugin, sdk_dir=sdk_dir or "")
+            )
+            await _emit(STATE_BUILDING)
+            ok, log = await build_image(directory, tag, runtime=runtime)
+        finally:
+            _unstage_sdk(directory)
         if not ok:
             await _emit(STATE_FAILED)
             return InstallResult(status=STATE_FAILED, plugin=plugin, errors=["image build failed"], log=log)
@@ -165,11 +226,19 @@ async def image_exists(tag: str, *, runtime: str = "docker") -> bool:
     return (await proc.wait()) == 0
 
 
-async def _default_build(plugin: InstalledPlugin, tag: str, *, runtime: str = "docker") -> bool:
+async def _default_build(
+    plugin: InstalledPlugin, tag: str, *, runtime: str = "docker", sdk_source: str = ""
+) -> bool:
     """Generate the Dockerfile and build the plugin's image. Returns ok."""
     directory = _plugin_root(plugin)
-    (directory / "Dockerfile.catlico").write_text(generate_dockerfile(plugin))
-    ok, log = await build_image(directory, tag, runtime=runtime)
+    sdk_dir = _stage_sdk(directory, sdk_source)
+    try:
+        (directory / "Dockerfile.catlico").write_text(
+            generate_dockerfile(plugin, sdk_dir=sdk_dir or "")
+        )
+        ok, log = await build_image(directory, tag, runtime=runtime)
+    finally:
+        _unstage_sdk(directory)
     if not ok:
         logger.error("build failed for %s:\n%s", tag, log)
     return ok
@@ -179,6 +248,7 @@ async def ensure_images(
     plugins,
     *,
     runtime: str = "docker",
+    sdk_source: str = "",
     exists=None,
     build=None,
 ) -> dict[str, str]:
@@ -198,7 +268,7 @@ async def ensure_images(
             return await image_exists(tag, runtime=runtime)
     if build is None:
         async def build(plugin: InstalledPlugin, tag: str) -> bool:  # noqa: E306
-            return await _default_build(plugin, tag, runtime=runtime)
+            return await _default_build(plugin, tag, runtime=runtime, sdk_source=sdk_source)
 
     states: dict[str, str] = {}
     for plugin in plugins:
