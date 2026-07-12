@@ -17,6 +17,7 @@ import asyncio
 import base64
 import json
 import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -264,6 +265,12 @@ class SubprocessSandboxRunner(SandboxRunner):
 
 RESULT_SENTINEL = "__CATLICO_RESULT__"
 
+#: Fixed in-container path where the run's secrets JSON is bind-mounted read-only.
+#: The worker reads secrets from here (via ``secrets_path`` in its stdin payload)
+#: instead of receiving them in-band on stdin. Kept under ``/run`` (a conventional
+#: location for runtime state) so it never collides with the plugin's own files.
+SECRETS_CONTAINER_PATH = "/run/catlico/secrets.json"
+
 
 def build_container_command(
     request: SandboxRunRequest,
@@ -272,6 +279,7 @@ def build_container_command(
     runtime: str = "docker",
     container_name: str,
     network: str = "bridge",
+    secrets_file: str | None = None,
 ) -> list[str]:
     """Pure: the ``docker/podman run`` argv for an untrusted plugin run.
 
@@ -280,7 +288,15 @@ def build_container_command(
     Linux capabilities, and no privilege escalation. Network defaults to a normal
     bridge (the plugin must reach the Catlico API); ``none`` fully isolates a
     plugin that declares no outbound needs.
+
+    When ``secrets_file`` (a host path) is given, it is bind-mounted read-only at
+    ``SECRETS_CONTAINER_PATH`` so the worker can read the run's secrets from a file
+    rather than in-band stdin. Docker creates the mountpoint even under the
+    ``--read-only`` root filesystem, so no extra tmpfs is needed for it.
     """
+    mount: list[str] = []
+    if secrets_file is not None:
+        mount = ["-v", f"{secrets_file}:{SECRETS_CONTAINER_PATH}:ro"]
     return [
         runtime, "run", "--rm", "-i",
         "--name", container_name,
@@ -291,6 +307,7 @@ def build_container_command(
         "--pids-limit", "256",
         "--read-only",
         "--tmpfs", "/tmp:rw,size=64m",
+        *mount,
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
         "--user", "65534:65534",  # nobody
@@ -333,6 +350,25 @@ class ContainerSandboxRunner(SandboxRunner):
         return f"catlico-plugin/{request.plugin_id}:{request.plugin_version}"
 
     async def run(self, request: SandboxRunRequest) -> SandboxRunResult:
+        # Secrets go to the container out-of-band: a host temp file bind-mounted
+        # read-only (never in the stdin payload, which is the whole point). The
+        # private 0700 dir protects the file from other host users; the file
+        # itself is world-readable so the container's non-root uid 65534 (nobody)
+        # can read it through the mount. The dir is always removed in `finally`.
+        secrets_dir = tempfile.mkdtemp(prefix="catlico-secrets-")
+        os.chmod(secrets_dir, 0o700)
+        secrets_file = os.path.join(secrets_dir, "secrets.json")
+        with open(secrets_file, "w") as fh:
+            json.dump(request.secrets, fh)
+        os.chmod(secrets_file, 0o644)  # world-readable: container uid 65534 reads it
+        try:
+            return await self._run_container(request, secrets_file=secrets_file)
+        finally:
+            shutil.rmtree(secrets_dir, ignore_errors=True)
+
+    async def _run_container(
+        self, request: SandboxRunRequest, *, secrets_file: str
+    ) -> SandboxRunResult:
         name = f"catlico-run-{request.run_id}"
         payload = {
             "run_id": request.run_id,
@@ -343,7 +379,9 @@ class ContainerSandboxRunner(SandboxRunner):
             "permissions": list(request.permissions),
             "event": request.event,
             "config": request.config,
-            "secrets": request.secrets,
+            # Secrets are NOT in the stdin payload; the worker reads them from the
+            # read-only bind-mounted file at this in-container path instead.
+            "secrets_path": SECRETS_CONTAINER_PATH,
             "api_base_url": request.api_base_url,
             "run_token": request.run_token,
             # No result_path -> worker emits the result on stdout (sentinel).
@@ -354,6 +392,7 @@ class ContainerSandboxRunner(SandboxRunner):
             runtime=self._runtime,
             container_name=name,
             network=self._network,
+            secrets_file=secrets_file,
         )
         proc = await asyncio.create_subprocess_exec(
             *command,
