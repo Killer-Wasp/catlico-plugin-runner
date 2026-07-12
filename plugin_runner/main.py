@@ -10,6 +10,11 @@ import uvicorn
 
 from plugin_runner.client import PluginRunnerClient
 from plugin_runner.installer import STATE_INSTALLED, ensure_images
+from plugin_runner.metrics import (
+    record_heartbeat,
+    set_installed_plugin_count,
+    set_isolation_mode,
+)
 from plugin_runner.registry import discover
 from plugin_runner.sandbox import ContainerSandboxRunner, SandboxRunner, SubprocessSandboxRunner
 from plugin_runner.server import create_app
@@ -232,6 +237,9 @@ async def _heartbeat_loop(
             raise
         except Exception:  # noqa: BLE001 — heartbeat must survive API blips
             logger.exception("heartbeat failed")
+            record_heartbeat("failure")
+        else:
+            record_heartbeat("success")
         await asyncio.sleep(settings.heartbeat_interval_seconds)
 
 
@@ -244,8 +252,10 @@ async def serve(
     runtime_check = runtime_check or _container_runtime_available
     registry = discover(settings.plugin_dirs)
     logger.info("discovered %d plugin(s)", len(registry.all()))
+    set_installed_plugin_count(len(registry.all()))
 
     sandbox = select_sandbox(settings)
+    set_isolation_mode(sandbox.isolation_mode)
     # Preflight before we enroll or build anything: if container isolation can't
     # work, refuse to start rather than register as healthy and fail every run.
     await _verify_container_runtime(sandbox, runtime_check)

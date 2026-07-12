@@ -8,8 +8,17 @@ database; all state changes go through the internal API.
 from __future__ import annotations
 
 import logging
+import time
 
 from plugin_runner.client import PluginRunnerClient
+from plugin_runner.metrics import (
+    observe_sandbox_duration,
+    record_claim_outcome,
+    record_dispatch_error,
+    record_run_failure,
+    record_suppressed_event,
+    record_terminal_status,
+)
 from plugin_runner.registry import InstalledPlugin, Registry
 from plugin_runner.sandbox import SandboxRunner, SandboxRunRequest
 
@@ -41,6 +50,7 @@ async def _run_one(
     """Claim, execute, and report a single plugin run. Returns its outcome."""
     claim = await client.claim_run(_claim_body(plugin, envelope, runner_id))
     outcome = claim["outcome"]
+    record_claim_outcome(outcome)
     if outcome != "created":
         # duplicate / deferred / skipped are all terminal for this runner.
         return outcome
@@ -66,7 +76,13 @@ async def _run_one(
         api_base_url=api_base_url,
         run_token=token,
     )
+    start = time.monotonic()
     result = await sandbox.run(request)
+    observe_sandbox_duration(time.monotonic() - start)
+
+    record_terminal_status(result.status)
+    if result.status in ("failure", "timeout"):
+        record_run_failure(result.error_kind)
 
     if result.status == "skipped":
         await client.skip_run(run_id, result.skip_reason or "should_process")
@@ -106,6 +122,7 @@ async def dispatch_event(
     actor = envelope.get("actor", "")
     if isinstance(actor, str) and actor.startswith("plugin:"):
         # Loop prevention (defense in depth; the API also suppresses these).
+        record_suppressed_event()
         return {"dispatched": 0, "suppressed": True, "outcomes": {}}
 
     target_plugin_id = envelope.get("target_plugin_id")
@@ -127,5 +144,6 @@ async def dispatch_event(
             )
         except Exception as exc:  # noqa: BLE001 — one plugin must not sink the event
             logger.exception("dispatch failed for plugin %s", plugin.id)
+            record_dispatch_error()
             outcomes[plugin.id] = f"error: {type(exc).__name__}"
     return {"dispatched": len(outcomes), "suppressed": False, "outcomes": outcomes}

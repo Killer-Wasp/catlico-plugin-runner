@@ -12,13 +12,15 @@ import hmac
 import json
 from typing import Callable
 
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from plugin_runner.client import PluginRunnerClient
 from plugin_runner.engine import dispatch_event
+from plugin_runner.metrics import REGISTRY as METRICS_REGISTRY
 from plugin_runner.registry import Registry
 from plugin_runner.sandbox import SandboxRunner, SubprocessSandboxRunner
 
@@ -91,11 +93,25 @@ def create_app(
         run_id = request.path_params["run_id"]
         return JSONResponse({"run_id": run_id, "cancelled": True})
 
+    async def metrics(request: Request) -> Response:
+        # Deliberately unauthenticated, at the Prometheus-conventional
+        # top-level path (not under /internal like the other routes here).
+        # This server binds to settings.host, which defaults to 0.0.0.0 (not
+        # restricted to an internal-only interface), so exposing /metrics
+        # without auth is a conscious choice, matching how Prometheus
+        # exporters are normally deployed (scraped over a private network,
+        # not gated per-endpoint) rather than a gap that mirrors the other
+        # (signed/internal) routes.
+        return Response(
+            generate_latest(METRICS_REGISTRY), media_type=CONTENT_TYPE_LATEST
+        )
+
     return Starlette(
         routes=[
             Route("/internal/health", health, methods=["GET"]),
             Route("/internal/plugins", plugins, methods=["GET"]),
             Route("/internal/events", events, methods=["POST"]),
             Route("/internal/runs/{run_id}/cancel", cancel_run, methods=["POST"]),
+            Route("/metrics", metrics, methods=["GET"]),
         ]
     )

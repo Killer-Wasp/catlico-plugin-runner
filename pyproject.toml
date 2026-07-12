@@ -7,6 +7,7 @@ requires-python = ">=3.14"
 dependencies = [
     "catlico-plugin-sdk",
     "httpx>=0.27",
+    "prometheus-client>=0.25.0",
     "pydantic-settings>=2.14.1",
     "starlette>=0.46",
     "uvicorn>=0.34",

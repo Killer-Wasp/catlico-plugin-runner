@@ -135,3 +135,14 @@ def test_signed_event_dispatches():
     )
     assert r.status_code == 200, r.text
     assert r.json()["outcomes"]["acme"] == "success"
+
+
+def test_metrics_endpoint_exposes_prometheus_text():
+    client = TestClient(_app())
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    body = r.text
+    assert "plugin_runner_runs_claimed_total" in body
+    assert "plugin_runner_runs_terminal_total" in body
+    assert "plugin_runner_sandbox_run_duration_seconds" in body
