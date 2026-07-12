@@ -235,3 +235,74 @@ async def test_install_from_source_clone_failure_emits_failed_no_crash(tmp_path)
     assert states[0] == STATE_CLONING
     assert states[-1] == STATE_FAILED
     assert any("clone failed" in e for e in result.errors)
+
+
+def _boom(*_a, **_k):
+    raise AssertionError("run must not be reached — value should be rejected first")
+
+
+def test_clone_source_rejects_leading_dash_ref(tmp_path):
+    # A ref like `--upload-pack=...`/`-f`/`--orphan` would reach git as an OPTION;
+    # reject it before ever invoking git (run= must not be called).
+    with pytest.raises(GitCloneError, match="source_ref"):
+        clone_source("file:///x", "--upload-pack=touch /tmp/pwn", tmp_path / "d", run=_boom)
+
+
+def test_clone_source_rejects_leading_dash_url(tmp_path):
+    with pytest.raises(GitCloneError, match="source_url"):
+        clone_source("--upload-pack=touch /tmp/pwn", "main", tmp_path / "d", run=_boom)
+
+
+def test_clone_source_uses_end_of_options_separator(tmp_path):
+    # Every git invocation must carry a `--` end-of-options separator so a
+    # crafted (non-dash-leading) url/ref still cannot be reparsed as a flag.
+    calls: list[list[str]] = []
+
+    def fake_run(argv):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="a" * 40 + "\n", stderr="")
+
+    clone_source("file:///repo", "main", tmp_path / "d", run=fake_run)
+    assert calls, "run was never called"
+    assert "--" in calls[0]  # the (successful) shallow clone
+    # url/ref both appear AFTER the separator, i.e. as operands not options.
+    sep = calls[0].index("--")
+    assert "file:///repo" in calls[0][sep + 1:]
+    assert "main" in calls[0][:sep]  # ref is a --branch value, guarded separately
+
+
+def test_clone_source_translates_timeout_to_gitcloneerror(tmp_path):
+    # An injected run= that raises TimeoutExpired (as the real timeout-bounded
+    # runner would) must surface as GitCloneError, not leak TimeoutExpired.
+    def timing_out(argv):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=120)
+
+    with pytest.raises(GitCloneError, match="timed out"):
+        clone_source("file:///repo", "main", tmp_path / "d", run=timing_out)
+
+
+def test_clone_source_rejects_garbage_rev_parse_output(tmp_path):
+    # rev-parse output that isn't a 40-char hex SHA must not be returned as a
+    # commit id; guard it and clean up the dest.
+    dest = tmp_path / "d"
+
+    def fake_run(argv):
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="not-a-sha\n", stderr="")
+        dest.mkdir(exist_ok=True)  # pretend a successful shallow clone populated dest
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    with pytest.raises(GitCloneError, match="rev-parse"):
+        clone_source("file:///repo", "main", dest, run=fake_run)
+    assert not dest.exists()  # garbage result cleaned up, no repo left behind
+
+
+def test_clone_source_bad_ref_leaves_no_repo_on_disk(tmp_path):
+    # A post-full-clone checkout failure (commit-SHA-shaped ref that doesn't
+    # exist) must rmtree the fully-cloned dest rather than leave it behind.
+    repo, _ = _make_git_repo(tmp_path)
+    dest = tmp_path / "dest"
+    missing_sha = "0" * 40  # 40-hex so it takes the full-clone+checkout fallback
+    with pytest.raises(GitCloneError):
+        clone_source(f"file://{repo}", missing_sha, dest)
+    assert not dest.exists()
