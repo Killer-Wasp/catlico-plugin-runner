@@ -1,6 +1,8 @@
 """Async HTTP client for the Catlico internal plugin-runner API."""
 from __future__ import annotations
 
+import urllib.parse
+
 import httpx
 
 _INTERNAL_PREFIX = "/api/internal/plugin-runner"
@@ -143,6 +145,41 @@ class PluginRunnerClient:
             )
             r.raise_for_status()
             return r.json()
+
+    async def report_install_status(
+        self,
+        plugin_version_id: str,
+        state: str,
+        *,
+        commit_sha: str | None = None,
+        image_digest: str | None = None,
+        install_log: str | None = None,
+        error: str | None = None,
+    ) -> dict | None:
+        """POST /plugins/{id}/install-status — report install progress back to the
+        API sink. ``state`` is one of the installer's ``STATE_*`` wire values
+        (cloning/validating/building/health_checking/installed/failed).
+
+        ``plugin_version_id`` may contain ``@``/``/`` (it is a version identifier,
+        not a UUID), and ``_url`` builds URLs by plain concatenation, so the id is
+        percent-encoded as a single path segment (``safe=""`` also encodes ``/``).
+        """
+        segment = urllib.parse.quote(plugin_version_id, safe="")
+        body = {
+            "state": state,
+            "commit_sha": commit_sha,
+            "image_digest": image_digest,
+            "install_log": install_log,
+            "error": error,
+        }
+        async with self._client() as client:
+            r = await client.post(
+                self._url(f"/plugins/{segment}/install-status"),
+                json=body,
+                headers=self._headers(),
+            )
+            r.raise_for_status()
+            return r.json() if r.content else None
 
     async def get_run_config(self, run_id: str) -> dict:
         """GET /runs/{id}/config."""

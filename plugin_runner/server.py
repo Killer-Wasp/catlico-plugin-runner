@@ -7,10 +7,14 @@ enrollment.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
-from typing import Callable
+import logging
+import tempfile
+from pathlib import Path
+from typing import Awaitable, Callable
 
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.applications import Starlette
@@ -20,9 +24,12 @@ from starlette.routing import Route
 
 from plugin_runner.client import PluginRunnerClient
 from plugin_runner.engine import dispatch_event
+from plugin_runner.installer import STATE_FAILED, STATE_INSTALLED, install_from_source
 from plugin_runner.metrics import REGISTRY as METRICS_REGISTRY
 from plugin_runner.registry import Registry
 from plugin_runner.sandbox import SandboxRunner, SubprocessSandboxRunner
+
+logger = logging.getLogger(__name__)
 
 SIGNATURE_HEADER = "x-catlico-signature"
 
@@ -46,11 +53,25 @@ def create_app(
     api_base_url: str,
     sandbox: SandboxRunner | None = None,
     push_secret: Callable[[], str] | None = None,
+    installer: Callable[..., Awaitable] = install_from_source,
+    sdk_source: str = "",
+    build_runtime: str = "docker",
+    install_root: Path | None = None,
+    spawn: Callable[[Awaitable], object] | None = None,
 ) -> Starlette:
     """Build the runner's private app. ``push_secret`` is a callable so the app
-    picks up the enrollment secret once it is set post-enrollment."""
+    picks up the enrollment secret once it is set post-enrollment.
+
+    ``installer``/``spawn`` are injectable so the background install can be driven
+    and observed in tests: ``installer`` defaults to ``install_from_source`` and
+    ``spawn`` to ``asyncio.create_task`` (fire-and-forget), but a test can pass a
+    fake installer plus a ``spawn`` that captures the coroutine to await it.
+    ``sdk_source``/``build_runtime`` feed the installer's build step;
+    ``install_root`` is the parent dir clones land under (keyed by plugin_id)."""
     sandbox = sandbox or SubprocessSandboxRunner()
     push_secret = push_secret or (lambda: client.push_signing_secret)
+    spawn = spawn or asyncio.create_task
+    install_root = install_root or (Path(tempfile.gettempdir()) / "catlico-plugin-installs")
 
     async def health(request: Request) -> JSONResponse:
         return JSONResponse(
@@ -86,6 +107,80 @@ def create_app(
         )
         return JSONResponse(summary)
 
+    async def _report_failed(plugin_version_id: str, error: str) -> None:
+        try:
+            await client.report_install_status(plugin_version_id, STATE_FAILED, error=error)
+        except Exception:  # noqa: BLE001 — reporting failure must not itself crash the task
+            logger.exception("failed to report install failure for %s", plugin_version_id)
+
+    async def _run_install(
+        plugin_version_id: str, plugin_id: str, source_url: str, source_ref: str
+    ) -> None:
+        """Background install driver. Clones + builds under
+        ``install_root/<plugin_id>`` and streams progress back to the API sink.
+
+        NOTE: this does NOT update the in-memory ``registry``, so a freshly
+        installed plugin is not yet discoverable/served by this running process —
+        a registry refresh / re-discovery (or a restart) is a deliberate
+        follow-up, out of scope for this endpoint."""
+        target_dir = install_root / plugin_id
+
+        async def on_state(state: str) -> None:
+            # Intermediate progress only. Terminal states are reported below from
+            # the InstallResult so they carry commit_sha/image_digest/log/error.
+            if state in (STATE_INSTALLED, STATE_FAILED):
+                return
+            await client.report_install_status(plugin_version_id, state)
+
+        try:
+            result = await installer(
+                source_url,
+                source_ref,
+                target_dir,
+                on_state=on_state,
+                sdk_source=sdk_source,
+                runtime=build_runtime,
+            )
+        except Exception as exc:  # noqa: BLE001 — a background task must never die silently
+            logger.exception("install of %s raised", plugin_version_id)
+            await _report_failed(plugin_version_id, str(exc))
+            return
+
+        try:
+            await client.report_install_status(
+                plugin_version_id,
+                result.status,
+                commit_sha=result.commit_sha or None,
+                # InstallResult only carries the image *tag* (no registry-pushed
+                # digest); it is the closest stable image identifier we have.
+                image_digest=result.image_tag or None,
+                install_log=result.log or None,
+                error="; ".join(result.errors) if result.errors else None,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "failed to report terminal install status for %s", plugin_version_id
+            )
+
+    async def install(request: Request) -> JSONResponse:
+        raw = await request.body()
+        if not _verify(raw, request.headers.get(SIGNATURE_HEADER), push_secret()):
+            return JSONResponse({"detail": "invalid signature"}, status_code=401)
+        try:
+            payload = json.loads(raw or b"{}")
+            plugin_version_id = payload["plugin_version_id"]
+            plugin_id = payload["plugin_id"]
+            source_url = payload["source_url"]
+            source_ref = payload["source_ref"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return JSONResponse({"detail": "invalid payload"}, status_code=400)
+        # Kick the clone+build off in the background so the HTTP response returns
+        # immediately (the API maps a slow/blocking response to a 502).
+        spawn(_run_install(plugin_version_id, plugin_id, source_url, source_ref))
+        return JSONResponse(
+            {"accepted": True, "plugin_version_id": plugin_version_id}, status_code=202
+        )
+
     async def cancel_run(request: Request) -> JSONResponse:
         # Best-effort: inline dispatch completes within the event request, so
         # there is usually no in-flight run to kill here. Wired for the
@@ -111,6 +206,7 @@ def create_app(
             Route("/internal/health", health, methods=["GET"]),
             Route("/internal/plugins", plugins, methods=["GET"]),
             Route("/internal/events", events, methods=["POST"]),
+            Route("/internal/plugins/install", install, methods=["POST"]),
             Route("/internal/runs/{run_id}/cancel", cancel_run, methods=["POST"]),
             Route("/metrics", metrics, methods=["GET"]),
         ]

@@ -58,6 +58,11 @@ class RunnerSettings(BaseSettings):
     #: Docker/Podman network. Ignored by the subprocess adapter.
     container_network: str = "bridge"
 
+    #: Parent directory GitHub/source installs are cloned + built under (keyed by
+    #: plugin_id) when the API triggers ``POST /internal/plugins/install``. Empty
+    #: (default) uses a subdir of the system temp dir.
+    install_root: str = ""
+
     #: Private HTTP server bind.
     host: str = "0.0.0.0"
     port: int = 8090

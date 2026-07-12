@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import httpx
 import uvicorn
@@ -273,6 +274,9 @@ async def serve(
         runner_id=settings.runner_id,
         api_base_url=settings.catlico_api_url,
         sandbox=sandbox,
+        sdk_source=settings.sdk_source,
+        build_runtime=settings.container_runtime,
+        install_root=Path(settings.install_root) if settings.install_root else None,
     )
     heartbeat = asyncio.create_task(_heartbeat_loop(client, settings, registry))
     config = uvicorn.Config(app, host=settings.host, port=settings.port, log_level="info")
