@@ -170,6 +170,31 @@ async def test_run_cleans_up_secret_file_on_failure(monkeypatch):
     assert not os.path.exists(os.path.dirname(captured["host_file"]))
 
 
+async def test_run_cleans_up_when_secret_write_fails(monkeypatch):
+    """Cleanup must hold even if writing the secret file itself raises (e.g. a
+    non-JSON-serializable secret value, or ENOSPC mid-write) -- the temp dir is
+    acquired before the guarded block, so it never leaks on the host."""
+    import plugin_runner.sandbox as sandbox
+
+    created: list[str] = []
+    real_mkdtemp = sandbox.tempfile.mkdtemp
+
+    def recording_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(sandbox.tempfile, "mkdtemp", recording_mkdtemp)
+
+    # A non-JSON-serializable secret value makes json.dump raise mid-write.
+    req = _request(secrets={"bad": object()})
+    with pytest.raises(TypeError):
+        await ContainerSandboxRunner().run(req)
+
+    assert created, "expected a temp secrets dir to be created"
+    assert not os.path.exists(created[0])  # no leaked (partially-written) secret dir
+
+
 # --- Gated: real Docker enforcement ---
 
 _DOCKER = shutil.which("docker")

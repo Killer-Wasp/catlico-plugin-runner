@@ -355,13 +355,16 @@ class ContainerSandboxRunner(SandboxRunner):
         # private 0700 dir protects the file from other host users; the file
         # itself is world-readable so the container's non-root uid 65534 (nobody)
         # can read it through the mount. The dir is always removed in `finally`.
+        # Acquire the dir FIRST, then guard everything else (the secret write and
+        # the run) under the finally, so a failure while writing/chmod-ing the
+        # file still cleans up the dir -- otherwise a partially-written secret
+        # file would leak on the host. mkdtemp already creates the dir 0700.
         secrets_dir = tempfile.mkdtemp(prefix="catlico-secrets-")
-        os.chmod(secrets_dir, 0o700)
-        secrets_file = os.path.join(secrets_dir, "secrets.json")
-        with open(secrets_file, "w") as fh:
-            json.dump(request.secrets, fh)
-        os.chmod(secrets_file, 0o644)  # world-readable: container uid 65534 reads it
         try:
+            secrets_file = os.path.join(secrets_dir, "secrets.json")
+            with open(secrets_file, "w") as fh:
+                json.dump(request.secrets, fh)
+            os.chmod(secrets_file, 0o644)  # world-readable: container uid 65534 reads it
             return await self._run_container(request, secrets_file=secrets_file)
         finally:
             shutil.rmtree(secrets_dir, ignore_errors=True)
