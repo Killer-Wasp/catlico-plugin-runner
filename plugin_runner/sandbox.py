@@ -14,11 +14,13 @@ third-party plugins.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import signal
 import sys
 import tempfile
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -87,15 +89,46 @@ def _tail(data: bytes, limit: int = LOG_TAIL_MAX_BYTES) -> str:
     return data[-limit:].decode("utf-8", errors="replace")
 
 
+def _secret_variants(value: str) -> set[str]:
+    """Expand a raw secret value into itself plus the encoded forms a plugin
+    might emit when logging it instead of the raw string.
+
+    Covers standard base64 and URL-safe base64 (each with and without ``=``
+    padding, since plugins/libraries commonly strip it) and both flavours of
+    URL percent-encoding (``quote`` and ``quote_plus``, which differ on
+    spaces and ``+``). Callers must only invoke this once ``value`` has
+    already passed the ``MIN_SECRET_LEN`` gate -- this helper does not
+    re-check length, so it never manufactures encoded noise for trivial
+    values on its own.
+    """
+    variants: set[str] = {value}
+    raw_bytes = value.encode("utf-8", errors="ignore")
+    if raw_bytes:
+        b64 = base64.b64encode(raw_bytes).decode("ascii")
+        variants.add(b64)
+        variants.add(b64.rstrip("="))
+        urlsafe = base64.urlsafe_b64encode(raw_bytes).decode("ascii")
+        variants.add(urlsafe)
+        variants.add(urlsafe.rstrip("="))
+    variants.add(urllib.parse.quote(value))
+    variants.add(urllib.parse.quote_plus(value))
+    variants.discard("")
+    return variants
+
+
 def _redact(text: str, secrets: dict | None, run_token: str = "") -> str:
     """Replace every secret value (and the run token) found in ``text`` with a
-    stable marker.
+    stable marker -- both in raw form and in common encoded forms (base64,
+    URL-safe base64, percent-encoding; see ``_secret_variants``).
 
     Non-string secret values (ints, bools) are coerced with ``str(...)`` so the
     redactor never crashes on them; they are matched against the printed form a
-    plugin would actually emit. Values shorter than ``MIN_SECRET_LEN`` are
-    skipped (see that constant). Longer values are replaced first so a secret
-    that contains a shorter secret as a substring is fully masked.
+    plugin would actually emit. Values whose RAW length is shorter than
+    ``MIN_SECRET_LEN`` are skipped entirely -- including their encoded forms --
+    since an encoded blob of a trivial value is noise/false-positive prone
+    (see that constant). Longer candidates are replaced first, across the full
+    raw + encoded set, so any candidate that contains a shorter one as a
+    substring is still fully masked.
     """
     candidates: set[str] = set()
     values = list((secrets or {}).values())
@@ -104,7 +137,7 @@ def _redact(text: str, secrets: dict | None, run_token: str = "") -> str:
     for raw in values:
         value = raw if isinstance(raw, str) else str(raw)
         if len(value) >= MIN_SECRET_LEN:
-            candidates.add(value)
+            candidates |= _secret_variants(value)
     for value in sorted(candidates, key=len, reverse=True):
         text = text.replace(value, REDACTION_MARKER)
     return text
