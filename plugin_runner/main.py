@@ -42,7 +42,9 @@ def select_sandbox(settings: RunnerSettings) -> SandboxRunner:
     if settings.isolation_mode == "subprocess":
         return SubprocessSandboxRunner()
     if settings.isolation_mode == "container":
-        return ContainerSandboxRunner()
+        return ContainerSandboxRunner(
+            runtime=settings.container_runtime, network=settings.container_network
+        )
     raise ValueError(
         f"invalid isolation_mode {settings.isolation_mode!r}; "
         f"valid values are: {', '.join(VALID_ISOLATION_MODES)}"

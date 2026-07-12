@@ -82,6 +82,8 @@ All settings use the `PLUGIN_RUNNER_` prefix (`plugin_runner/settings.py`):
 | `PLUGIN_RUNNER_STATE_FILE` | `.runner-state.json` | Owner-only (`0600`) cache of the enrolled credential + push secret; point at a persistent volume in containers |
 | `PLUGIN_RUNNER_PLUGIN_DIRS` | `[]` | Directories scanned for plugins (JSON list) |
 | `PLUGIN_RUNNER_ISOLATION_MODE` | `container` | `container` (hardened, the default) or `subprocess` (trusted dev only); anything else is rejected at startup |
+| `PLUGIN_RUNNER_CONTAINER_RUNTIME` | `docker` | Container runtime binary the container adapter shells out to (e.g. `podman`); ignored in `subprocess` mode |
+| `PLUGIN_RUNNER_CONTAINER_NETWORK` | `bridge` | `--network` value for the container adapter (`bridge`, `none`, or a named network); ignored in `subprocess` mode |
 | `PLUGIN_RUNNER_HOST` | `0.0.0.0` | Private API bind host |
 | `PLUGIN_RUNNER_PORT` | `8090` | Private API bind port |
 | `PLUGIN_RUNNER_HEARTBEAT_INTERVAL_SECONDS` | `30` | Heartbeat cadence to the API |

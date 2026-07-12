@@ -8,7 +8,12 @@ import pytest
 
 from plugin_runner import main
 from plugin_runner.registry import Registry
-from plugin_runner.sandbox import ContainerSandboxRunner, SubprocessSandboxRunner
+from plugin_runner.sandbox import (
+    ContainerSandboxRunner,
+    SandboxRunRequest,
+    SubprocessSandboxRunner,
+    build_container_command,
+)
 from plugin_runner.settings import RunnerSettings
 
 
@@ -16,6 +21,26 @@ from plugin_runner.settings import RunnerSettings
 
 def test_default_isolation_mode_is_container():
     assert RunnerSettings().isolation_mode == "container"
+
+
+def test_default_container_runtime_and_network():
+    settings = RunnerSettings()
+    assert settings.container_runtime == "docker"
+    assert settings.container_network == "bridge"
+
+
+def test_container_runtime_and_network_overridable_via_kwargs():
+    settings = RunnerSettings(container_runtime="podman", container_network="none")
+    assert settings.container_runtime == "podman"
+    assert settings.container_network == "none"
+
+
+def test_container_runtime_and_network_overridable_via_env(monkeypatch):
+    monkeypatch.setenv("PLUGIN_RUNNER_CONTAINER_RUNTIME", "podman")
+    monkeypatch.setenv("PLUGIN_RUNNER_CONTAINER_NETWORK", "none")
+    settings = RunnerSettings()
+    assert settings.container_runtime == "podman"
+    assert settings.container_network == "none"
 
 
 # --- adapter selection -------------------------------------------------------
@@ -38,6 +63,40 @@ def test_select_sandbox_rejects_unknown_mode():
     # The error must name the valid values rather than silently degrade.
     assert "container" in message
     assert "subprocess" in message
+
+
+def test_select_sandbox_defaults_carry_docker_bridge():
+    sandbox = main.select_sandbox(RunnerSettings())
+    assert sandbox._runtime == "docker"
+    assert sandbox._network == "bridge"
+
+
+def test_select_sandbox_honours_configured_runtime_and_network():
+    settings = RunnerSettings(container_runtime="podman", container_network="none")
+    sandbox = main.select_sandbox(settings)
+    assert isinstance(sandbox, ContainerSandboxRunner)
+    assert sandbox._runtime == "podman"
+    assert sandbox._network == "none"
+
+
+def test_select_sandbox_wiring_reaches_build_container_command():
+    """End-to-end: a configured runtime/network flows from settings through the
+    adapter constructed by select_sandbox into the actual command argv."""
+    settings = RunnerSettings(container_runtime="podman", container_network="none")
+    sandbox = main.select_sandbox(settings)
+    request = SandboxRunRequest(
+        run_id="run-1", plugin_module="acme.plugin", plugin_class="Plugin",
+        event={}, plugin_id="acme", plugin_version="1.0.0",
+    )
+    cmd = build_container_command(
+        request,
+        image=sandbox._image_for(request),
+        runtime=sandbox._runtime,
+        container_name="c1",
+        network=sandbox._network,
+    )
+    assert cmd[0] == "podman"
+    assert "--network none" in " ".join(cmd)
 
 
 # --- startup runtime preflight ----------------------------------------------

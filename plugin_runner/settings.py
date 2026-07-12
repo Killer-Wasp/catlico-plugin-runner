@@ -45,6 +45,19 @@ class RunnerSettings(BaseSettings):
     #: rejected at startup (see ``select_sandbox``).
     isolation_mode: str = "container"
 
+    #: Container runtime binary invoked by the container adapter (argv[0] of
+    #: every ``run``/``kill`` command it shells out to). ``docker`` (the
+    #: default) or ``podman`` are the expected values; any binary on PATH that
+    #: understands docker-compatible ``run``/``kill`` flags works. Ignored by
+    #: the subprocess adapter.
+    container_runtime: str = "docker"
+
+    #: Value passed to the container adapter's ``--network`` flag, e.g.
+    #: ``bridge`` (the default; the plugin can reach the Catlico API),
+    #: ``none`` (fully isolates a plugin with no outbound needs), or a named
+    #: Docker/Podman network. Ignored by the subprocess adapter.
+    container_network: str = "bridge"
+
     #: Private HTTP server bind.
     host: str = "0.0.0.0"
     port: int = 8090
