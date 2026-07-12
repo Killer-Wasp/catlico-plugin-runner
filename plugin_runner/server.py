@@ -64,14 +64,30 @@ def create_app(
 
     ``installer``/``spawn`` are injectable so the background install can be driven
     and observed in tests: ``installer`` defaults to ``install_from_source`` and
-    ``spawn`` to ``asyncio.create_task`` (fire-and-forget), but a test can pass a
-    fake installer plus a ``spawn`` that captures the coroutine to await it.
+    ``spawn`` to a task-retaining ``create_task`` wrapper (fire-and-forget), but a
+    test can pass a fake installer plus a ``spawn`` that captures the coroutine to
+    await it.
     ``sdk_source``/``build_runtime`` feed the installer's build step;
     ``install_root`` is the parent dir clones land under (keyed by plugin_id)."""
     sandbox = sandbox or SubprocessSandboxRunner()
     push_secret = push_secret or (lambda: client.push_signing_secret)
-    spawn = spawn or asyncio.create_task
     install_root = install_root or (Path(tempfile.gettempdir()) / "catlico-plugin-installs")
+
+    # Retain a strong reference to every background install task for its whole
+    # lifetime. ``asyncio`` keeps only a WEAK reference to a bare ``create_task``
+    # result, so a fire-and-forget task can be garbage-collected — and thus
+    # silently cancelled — mid clone/build before it ever reports a result. This
+    # set is closed over by the app's handlers (held by the returned Starlette
+    # app), so it lives as long as the app rather than being a GC-able local.
+    _pending: set = set()
+
+    def _default_spawn(coro: Awaitable) -> object:
+        task = asyncio.create_task(coro)
+        _pending.add(task)
+        task.add_done_callback(_pending.discard)
+        return task
+
+    spawn = spawn or _default_spawn
 
     async def health(request: Request) -> JSONResponse:
         return JSONResponse(

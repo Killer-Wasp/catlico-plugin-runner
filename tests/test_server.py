@@ -1,5 +1,6 @@
 """Runner private HTTP server: health, plugins, and signed event push."""
 import json
+import time
 
 from starlette.testclient import TestClient
 
@@ -265,6 +266,63 @@ async def test_install_reports_failed_when_installer_returns_failed():
     assert terminal["state"] == "failed"
     assert terminal["error"] == "image build failed"
     assert terminal["install_log"] == "boom log"
+
+
+def test_install_default_spawn_runs_to_completion():
+    # OMIT `spawn` so the real task-retaining default runs. This locks in that the
+    # background install Task is strongly referenced (not GC-cancelled mid-flight)
+    # and actually completes + reports. Uses TestClient as a context manager so a
+    # persistent event loop keeps running the background task after the 202.
+    cap = _CaptureClient()
+    result = InstallResult(status=STATE_INSTALLED, commit_sha="c0ffee", image_tag="tag:1")
+    installer = _fake_installer(["cloning", "validating", "installed"], result)
+    app = create_app(
+        client=cap,
+        registry=_registry(),
+        runner_id="runner-1",
+        api_base_url="http://catlico:8000",
+        sandbox=_FakeSandbox(),
+        installer=installer,
+        # spawn intentionally omitted -> exercises _default_spawn.
+    )
+    with TestClient(app) as client:
+        r = client.post(
+            "/internal/plugins/install",
+            content=_INSTALL_BODY,
+            headers={"x-catlico-signature": sign_body(_INSTALL_BODY, PUSH_SECRET)},
+        )
+        assert r.status_code == 202
+        deadline = time.time() + 5
+        while time.time() < deadline and not any(
+            rep["state"] == "installed" for rep in cap.reports
+        ):
+            time.sleep(0.02)
+
+    states = [rep["state"] for rep in cap.reports]
+    assert states == ["cloning", "validating", "installed"]
+    assert cap.reports[-1]["commit_sha"] == "c0ffee"
+
+
+def test_install_rejects_invalid_payload():
+    cap = _CaptureClient()
+    spawned = []
+    client = TestClient(_install_app(cap, spawned, _fake_installer([], None)))
+
+    def signed(body: bytes) -> dict:
+        return {"x-catlico-signature": sign_body(body, PUSH_SECRET)}
+
+    # Malformed JSON — valid signature, so it reaches the parse branch.
+    bad_json = b"{not json"
+    r1 = client.post("/internal/plugins/install", content=bad_json, headers=signed(bad_json))
+    assert r1.status_code == 400
+
+    # Well-formed JSON missing required keys.
+    missing = json.dumps({"plugin_version_id": "acme@1.0.0"}).encode()
+    r2 = client.post("/internal/plugins/install", content=missing, headers=signed(missing))
+    assert r2.status_code == 400
+
+    # A 400 never spawns an install.
+    assert spawned == []
 
 
 async def test_install_reports_failed_when_installer_raises():
