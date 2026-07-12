@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,6 +49,7 @@ class InstallResult:
     image_tag: str = ""
     errors: list[str] = field(default_factory=list)
     log: str = ""
+    commit_sha: str = ""
 
 
 def validate_manifest(manifest: dict, *, strict: bool = False) -> list[str]:
@@ -155,6 +157,74 @@ async def build_image(
     return proc.returncode == 0, (out or b"").decode("utf-8", errors="replace")
 
 
+class GitCloneError(RuntimeError):
+    """Raised when cloning plugin source from git or resolving its ref fails."""
+
+
+def _default_git_run(argv: list[str]) -> subprocess.CompletedProcess:
+    """Real subprocess runner used by ``clone_source``. Never invoked with
+    ``shell=True``; ``argv`` is always a literal list, so untrusted URLs/refs
+    can't reach a shell even though this ultimately execs ``git``."""
+    return subprocess.run(argv, capture_output=True, text=True)
+
+
+def clone_source(
+    source_url: str,
+    source_ref: str,
+    dest: Path,
+    *,
+    run=_default_git_run,
+) -> str:
+    """Clone ``source_url`` at ``source_ref`` into ``dest``, returning the
+    resolved 40-char commit SHA at HEAD.
+
+    Supported ``source_ref`` kinds:
+      - branch or tag name: satisfied by the fast path, a shallow
+        ``git clone --depth 1 --branch <ref>`` (single-commit fetch).
+      - raw commit SHA (full or abbreviated): ``--branch`` cannot target a
+        commit, so the shallow clone predictably fails and this falls back to
+        a full clone followed by ``git checkout <ref>``, which accepts any
+        ref. This full clone fetches the whole history, so it is slower.
+
+    Every git invocation is an argv list passed to ``run`` (default: a plain
+    ``subprocess.run`` wrapper) — never ``shell=True`` and never string
+    interpolation into a shell command — so a malicious ``source_url`` or
+    ``source_ref`` (e.g. containing shell metacharacters) cannot execute
+    anything beyond being passed as a literal git argument. ``run`` is
+    injectable so tests can point this at a local ``file://`` checkout with
+    no network, or fake failures without shelling out at all.
+
+    Raises ``GitCloneError`` with the underlying git stderr/stdout on any
+    failure (bad URL, unresolvable ref, corrupt repo, ...).
+    """
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    shallow = run(["git", "clone", "--depth", "1", "--branch", source_ref, source_url, str(dest)])
+    if shallow.returncode != 0:
+        shutil.rmtree(dest, ignore_errors=True)
+        full = run(["git", "clone", source_url, str(dest)])
+        if full.returncode != 0:
+            raise GitCloneError(
+                f"git clone of {source_url!r} failed: "
+                f"{(full.stderr or full.stdout or '').strip()}"
+            )
+        checkout = run(["git", "-C", str(dest), "checkout", source_ref])
+        if checkout.returncode != 0:
+            raise GitCloneError(
+                f"git checkout of ref {source_ref!r} in {source_url!r} failed: "
+                f"{(checkout.stderr or checkout.stdout or '').strip()}"
+            )
+
+    rev = run(["git", "-C", str(dest), "rev-parse", "HEAD"])
+    if rev.returncode != 0:
+        raise GitCloneError(f"git rev-parse HEAD failed: {(rev.stderr or '').strip()}")
+    sha = rev.stdout.strip()
+    if len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha):
+        raise GitCloneError(f"unexpected output from git rev-parse HEAD: {sha!r}")
+    return sha
+
+
 async def install_local(
     directory: Path,
     *,
@@ -206,6 +276,56 @@ async def install_local(
 
     await _emit(STATE_INSTALLED)
     return InstallResult(status=STATE_INSTALLED, plugin=plugin, image_tag=tag)
+
+
+async def install_from_source(
+    source_url: str,
+    source_ref: str,
+    target_dir: Path,
+    *,
+    clone=clone_source,
+    strict: bool = False,
+    runtime: str = "docker",
+    build: bool = True,
+    sdk_source: str = "",
+    on_state=None,
+) -> InstallResult:
+    """GitHub (or any git remote) install path: clone ``source_url`` at
+    ``source_ref`` into ``target_dir``, then run the same
+    validate -> build -> health-check pipeline as ``install_local``.
+
+    A future HTTP install endpoint (not part of this change — see
+    ``plugin_runner/server.py``) is the intended caller: once it knows a
+    ``PluginVersion``'s ``source_url``/``source_ref``, it calls this with a
+    scratch ``target_dir`` and streams ``on_state`` transitions back as
+    ``PluginVersion.status``.
+
+    ``clone`` is injectable (defaults to ``clone_source``) so callers/tests
+    can fake the clone step entirely. Mirrors ``install_local``: a clone
+    failure never raises out of this function — it emits ``STATE_FAILED`` and
+    returns a failed ``InstallResult``, same as a validation or build failure.
+    """
+    async def _emit(state: str) -> None:
+        if on_state is not None:
+            await on_state(state)
+
+    await _emit(STATE_CLONING)
+    try:
+        commit_sha = await asyncio.to_thread(clone, source_url, source_ref, target_dir)
+    except Exception as exc:  # noqa: BLE001 — any clone failure -> failed install
+        await _emit(STATE_FAILED)
+        return InstallResult(status=STATE_FAILED, errors=[f"clone failed: {exc}"])
+
+    result = await install_local(
+        target_dir,
+        strict=strict,
+        runtime=runtime,
+        build=build,
+        sdk_source=sdk_source,
+        on_state=on_state,
+    )
+    result.commit_sha = commit_sha
+    return result
 
 
 def _plugin_root(plugin: InstalledPlugin) -> Path:

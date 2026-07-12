@@ -1,16 +1,23 @@
 """Install pipeline: manifest validation, Dockerfile generation, lockfile check,
 and the validation path of install_local (no Docker)."""
+import subprocess
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from plugin_runner.installer import (
+    STATE_CLONING,
     STATE_FAILED,
     STATE_INSTALLED,
+    GitCloneError,
     _stage_sdk,
     _unstage_sdk,
+    clone_source,
     generate_dockerfile,
     has_lockfile,
     image_tag,
+    install_from_source,
     install_local,
     validate_manifest,
 )
@@ -137,3 +144,94 @@ async def test_install_local_strict_requires_lockfile(tmp_path):
 
 async def _record(states, s):
     states.append(s)
+
+
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=True
+    )
+
+
+def _make_git_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A local git repo (no network) holding a valid, buildable plugin dir at
+    its root, with a single commit. Returns (repo_dir, head_sha)."""
+    repo = tmp_path / "src_repo"
+    repo.mkdir()
+    _git("init", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "catlico-plugin.toml").write_text(textwrap.dedent("""
+        id = "acme"
+        version = "1.0.0"
+        entrypoint = "acme.plugin:Plugin"
+        triggers = ["observable.created"]
+        permissions = ["read:observable"]
+        timeout_seconds = 60
+    """))
+    (repo / "requirements.txt").write_text("httpx\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "initial", cwd=repo)
+    sha = _git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+    return repo, sha
+
+
+def test_clone_source_branch_ref_returns_head_sha_and_lands_files(tmp_path):
+    repo, sha = _make_git_repo(tmp_path)
+    dest = tmp_path / "dest"
+    resolved = clone_source(f"file://{repo}", "main", dest)
+    assert resolved == sha
+    assert len(resolved) == 40
+    assert (dest / "catlico-plugin.toml").is_file()
+
+
+def test_clone_source_commit_sha_ref_falls_back_to_full_clone(tmp_path):
+    # --branch cannot target a raw commit SHA; clone_source must fall back to
+    # a full clone + checkout so commit-pinned installs still work.
+    repo, sha = _make_git_repo(tmp_path)
+    dest = tmp_path / "dest"
+    resolved = clone_source(f"file://{repo}", sha, dest)
+    assert resolved == sha
+    assert (dest / "catlico-plugin.toml").is_file()
+
+
+def test_clone_source_bad_ref_raises(tmp_path):
+    repo, _ = _make_git_repo(tmp_path)
+    dest = tmp_path / "dest"
+    with pytest.raises(GitCloneError):
+        clone_source(f"file://{repo}", "no-such-ref", dest)
+
+
+def test_clone_source_bad_url_raises(tmp_path):
+    dest = tmp_path / "dest"
+    with pytest.raises(GitCloneError):
+        clone_source(f"file://{tmp_path / 'does-not-exist'}", "main", dest)
+
+
+async def test_install_from_source_happy_path_emits_cloning_first(tmp_path):
+    repo, sha = _make_git_repo(tmp_path)
+    dest = tmp_path / "dest"
+    states: list[str] = []
+    result = await install_from_source(
+        f"file://{repo}", "main", dest,
+        build=False, on_state=lambda s: _record(states, s),
+    )
+    assert result.status == STATE_INSTALLED
+    assert result.commit_sha == sha
+    assert result.plugin.id == "acme"
+    assert states[0] == STATE_CLONING  # previously-dead constant, now emitted
+    assert states.index(STATE_CLONING) < states.index("validating")
+    assert "validating" in states and "installed" in states
+
+
+async def test_install_from_source_clone_failure_emits_failed_no_crash(tmp_path):
+    dest = tmp_path / "dest"
+    states: list[str] = []
+    result = await install_from_source(
+        f"file://{tmp_path / 'nope'}", "main", dest,
+        on_state=lambda s: _record(states, s),
+    )
+    assert result.status == STATE_FAILED
+    assert result.plugin is None
+    assert states[0] == STATE_CLONING
+    assert states[-1] == STATE_FAILED
+    assert any("clone failed" in e for e in result.errors)
