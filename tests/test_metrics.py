@@ -5,7 +5,7 @@ Mirrors tests/test_engine.py's fakes rather than importing them, since test
 modules here are standalone (no shared fixtures/__init__.py).
 """
 from plugin_runner.engine import dispatch_event
-from plugin_runner.metrics import REGISTRY
+from plugin_runner.metrics import REGISTRY, record_run_failure
 from plugin_runner.registry import InstalledPlugin, Registry
 from plugin_runner.sandbox import SandboxRunResult
 
@@ -140,6 +140,46 @@ async def test_failure_with_error_kind_increments_failure_counter():
         _counter_value("plugin_runner_run_failures_total", error_kind="transient")
         == before_failure + 1
     )
+
+
+def _error_kind_label_values() -> set[str]:
+    """Every error_kind label value currently present on run_failures_total."""
+    values = set()
+    for metric in REGISTRY.collect():
+        if metric.name == "plugin_runner_run_failures":
+            for sample in metric.samples:
+                if sample.name == "plugin_runner_run_failures_total":
+                    values.add(sample.labels["error_kind"])
+    return values
+
+
+def test_bogus_error_kind_clamped_to_other_no_new_label():
+    """An arbitrary (untrusted, plugin-supplied) error_kind must NOT become a
+    new label value — it buckets into "other" — guarding label cardinality."""
+    before = _counter_value("plugin_runner_run_failures_total", error_kind="other")
+    bogus = "per-run-unique-9f3c2a-attacker-controlled"
+
+    record_run_failure(bogus)
+
+    labels = _error_kind_label_values()
+    assert bogus not in labels
+    assert labels <= {"transient", "config", "input", "bug", "other"}
+    assert _counter_value("plugin_runner_run_failures_total", error_kind="other") == before + 1
+
+
+def test_none_error_kind_buckets_to_other_never_dropped():
+    """A falsy error_kind still counts as a failure (bucketed "other") so
+    run_failures_total does not silently diverge from the terminal-status count."""
+    before = _counter_value("plugin_runner_run_failures_total", error_kind="other")
+
+    record_run_failure(None)
+    record_run_failure("")
+
+    assert (
+        _counter_value("plugin_runner_run_failures_total", error_kind="other")
+        == before + 2
+    )
+    assert "" not in _error_kind_label_values()
 
 
 async def test_dispatch_exception_increments_dispatch_error_counter():

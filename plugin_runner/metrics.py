@@ -25,6 +25,10 @@ REGISTRY = CollectorRegistry()
 
 # --- Run lifecycle -----------------------------------------------------
 
+# Note: a "skip" can surface at two distinct pipeline stages, so total skips =
+# runs_claimed_total{outcome=skipped} (the API declined the claim up front)
+# + runs_terminal_total{status=skipped} (the plugin ran and chose to skip).
+# They are different events — do not treat either alone as "all skips".
 runs_claimed_total = Counter(
     "plugin_runner_runs_claimed_total",
     "Runs claimed from the Catlico API, by claim outcome.",
@@ -39,10 +43,19 @@ runs_terminal_total = Counter(
     registry=REGISTRY,
 )
 
+#: The only error_kind label values ever emitted. Anything else — including a
+#: falsy/missing kind — is bucketed as "other" by ``record_run_failure``.
+#: error_kind ultimately originates from untrusted plugin code (a plugin-defined
+#: exception's ``error_kind`` attribute, read out of the sandbox's JSON), so it
+#: MUST be clamped to this fixed set before becoming a Prometheus label —
+#: otherwise a plugin could emit per-run-unique kinds and blow up label
+#: cardinality.
+ERROR_KINDS = frozenset({"transient", "config", "input", "bug"})
+
 run_failures_total = Counter(
     "plugin_runner_run_failures_total",
-    "Run failures, by error kind.",
-    ["error_kind"],  # transient | config | input | bug
+    "Run failures, by error kind (clamped to a fixed enum; see ERROR_KINDS).",
+    ["error_kind"],  # transient | config | input | bug | other
     registry=REGISTRY,
 )
 
@@ -77,6 +90,9 @@ sandbox_run_duration_seconds = Histogram(
 )
 
 # --- Gauges ------------------------------------------------------------
+# Both gauges reflect boot-time configuration: main.serve sets them once at
+# startup (they don't change while the runner is up), so they read as static
+# facts about this runner rather than live time-series.
 
 installed_plugin_count = Gauge(
     "plugin_runner_installed_plugin_count",
@@ -105,8 +121,13 @@ def record_terminal_status(status: str) -> None:
 
 
 def record_run_failure(error_kind: str | None) -> None:
-    if error_kind:
-        run_failures_total.labels(error_kind=error_kind).inc()
+    # Clamp to the fixed enum (untrusted origin — see ERROR_KINDS) and ALWAYS
+    # record: a falsy/unknown kind buckets to "other" rather than being dropped,
+    # so run_failures_total never silently diverges from
+    # runs_terminal_total{status=failure|timeout} — every failure/timeout is
+    # counted exactly once here.
+    bucket = error_kind if error_kind in ERROR_KINDS else "other"
+    run_failures_total.labels(error_kind=bucket).inc()
 
 
 def record_dispatch_error() -> None:
