@@ -12,8 +12,17 @@ class RunnerSettings(BaseSettings):
     name: str = "Catlico Plugin Runner"
     version: str = "0.1.0"
 
-    #: Base URL of the Catlico API (control plane).
+    #: Base URL of the Catlico API (control plane) as reached by the *runner*.
     catlico_api_url: str = "http://localhost:8000"
+
+    #: Base URL the *plugin sandbox* uses to reach the Catlico runtime API. Empty
+    #: (default) reuses ``catlico_api_url``. Override it when a plugin container
+    #: cannot resolve the runner's own URL — e.g. local container-isolation dev on
+    #: Docker Desktop, where the API runs on the host and the runner uses
+    #: ``localhost`` but a bridged plugin container must use
+    #: ``http://host.docker.internal:8000`` (the ``host.docker.internal`` hostname
+    #: is made resolvable via ``--add-host`` in the container adapter).
+    plugin_api_url: str = ""
 
     #: One-time enrollment token, issued by Catlico when the runner is registered.
     #: Only consulted when there is no usable persisted credential (first start,
@@ -57,6 +66,14 @@ class RunnerSettings(BaseSettings):
     #: ``none`` (fully isolates a plugin with no outbound needs), or a named
     #: Docker/Podman network. Ignored by the subprocess adapter.
     container_network: str = "bridge"
+
+    #: Extra ``--add-host`` entries for plugin containers (``"name:ip"`` each).
+    #: Empty by default: Docker Desktop already resolves ``host.docker.internal``
+    #: to the host. On native Linux, set
+    #: ``["host.docker.internal:host-gateway"]`` so a plugin can reach a Catlico
+    #: API on the runner host (see ``plugin_api_url``). Ignored by the subprocess
+    #: adapter.
+    container_extra_hosts: list[str] = []
 
     #: Parent directory GitHub/source installs are cloned + built under (keyed by
     #: plugin_id) when the API triggers ``POST /internal/plugins/install``. Empty

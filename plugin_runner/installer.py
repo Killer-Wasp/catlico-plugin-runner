@@ -35,7 +35,9 @@ STATE_HEALTH_CHECKING = "health_checking"
 STATE_INSTALLED = "installed"
 STATE_FAILED = "failed"
 
-_LOCKFILES = ("uv.lock", "poetry.lock", "requirements.txt")
+#: Plugins pin dependencies with uv. A committed uv.lock is the only accepted
+#: lockfile — `requirements.txt`/`poetry.lock` are intentionally not honored.
+_LOCKFILES = ("uv.lock",)
 _ALLOWED_PERMISSIONS = {
     "read:case", "read:alert", "read:observable",
     "write:case", "write:task", "write:observable", "write:observable_enrichment",
@@ -95,13 +97,24 @@ def generate_dockerfile(plugin: InstalledPlugin, *, sdk_dir: str = "") -> str:
         )
     else:
         install_sdk = "RUN pip install --no-cache-dir catlico-plugin-sdk\n"
+    # Third-party deps come from the uv lock, not a requirements.txt. `uv export
+    # --frozen` reads the committed uv.lock and never re-resolves (the SDK path
+    # source is absent inside the build context), `--no-emit-project` drops the
+    # plugin package itself (it runs from PYTHONPATH, uninstalled), and
+    # `--no-emit-package catlico-plugin-sdk` drops the separately-installed SDK.
+    # A plugin with no third-party deps yields an empty list — the step is a no-op.
     install_deps = (
-        "RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi\n"
+        "RUN uv export --frozen --no-dev --no-emit-project "
+        "--no-emit-package catlico-plugin-sdk --no-hashes -o /tmp/deps.txt "
+        "&& uv pip install --system --no-cache -r /tmp/deps.txt "
+        "&& rm -f /tmp/deps.txt\n"
     )
     return (
         # 3.14+: the SDK and plugins declare requires-python >=3.14 (matches the
         # workspace toolchain); an older base fails `pip install` on that marker.
         "FROM python:3.14-slim\n"
+        # uv drives dependency install from the lock (pinned for reproducibility).
+        "COPY --from=ghcr.io/astral-sh/uv:0.11.7 /uv /bin/uv\n"
         "RUN useradd --uid 65534 --no-create-home nobodyplugin || true\n"
         "WORKDIR /plugin\n"
         "COPY . /plugin\n"
@@ -308,7 +321,7 @@ async def install_local(
 
     errors = validate_manifest(plugin.manifest, strict=strict)
     if not has_lockfile(directory):
-        msg = "no lockfile (uv.lock/poetry.lock/requirements.txt)"
+        msg = "no uv.lock (run `uv lock` in the plugin dir)"
         if strict:
             errors.append(msg)
         else:

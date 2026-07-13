@@ -1,0 +1,32 @@
+{
+  "_comment": "e2e scenarios for e2e_check.py. Key = plugin id. Fields: observable_type, observable_value, settings (non-secret config), secrets_env (secret param -> env var to read it from, so no secrets live here), expect {verdict?, source?, normalized?}. DETERMINISTIC/offline plugins (observable-validator) can assert a verdict. Plugins that call a LIVE vendor should assert only 'source' (verdict depends on live data) and use a generous CATLICO_E2E_TIMEOUT. Some vendors are slow/rate-limited (crt.sh can exceed the plugin's 30s timeout) — pick a fast one like ip-api for a reliable smoke test.",
+
+  "observable-validator": {
+    "observable_type": "ip",
+    "observable_value": "9.9.9.9",
+    "expect": {
+      "verdict": "valid",
+      "source": "Observable Validator",
+      "normalized": { "value": "9.9.9.9", "verdict": "valid" }
+    }
+  },
+
+  "ip-api": {
+    "observable_type": "ip",
+    "observable_value": "8.8.8.8",
+    "expect": { "source": "IP-API", "verdict": "info" }
+  },
+
+  "crtsh": {
+    "observable_type": "domain",
+    "observable_value": "example.com",
+    "expect": { "source": "crt.sh" }
+  },
+
+  "abuseipdb": {
+    "observable_type": "ip",
+    "observable_value": "118.25.6.39",
+    "secrets_env": { "key": "ABUSEIPDB_API_KEY" },
+    "expect": { "source": "AbuseIPDB" }
+  }
+}

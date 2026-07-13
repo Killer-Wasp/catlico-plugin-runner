@@ -280,6 +280,7 @@ def build_container_command(
     container_name: str,
     network: str = "bridge",
     secrets_file: str | None = None,
+    extra_hosts: list[str] | None = None,
 ) -> list[str]:
     """Pure: the ``docker/podman run`` argv for an untrusted plugin run.
 
@@ -297,10 +298,20 @@ def build_container_command(
     mount: list[str] = []
     if secrets_file is not None:
         mount = ["-v", f"{secrets_file}:{SECRETS_CONTAINER_PATH}:ro"]
+    # Extra ``--add-host`` entries. Empty by default: Docker Desktop (Mac/Windows)
+    # already resolves ``host.docker.internal`` to the host, and adding a
+    # ``:host-gateway`` mapping there actually *breaks* it (it points at the Linux
+    # VM's bridge, not the host). On native Linux, set
+    # ``container_extra_hosts=["host.docker.internal:host-gateway"]`` so a plugin
+    # can reach a Catlico API on the runner host — see ``RunnerSettings.plugin_api_url``.
+    hosts: list[str] = []
+    for entry in extra_hosts or []:
+        hosts += ["--add-host", entry]
     return [
         runtime, "run", "--rm", "-i",
         "--name", container_name,
         "--network", network,
+        *hosts,
         "--memory", f"{request.memory_limit_mb}m",
         "--memory-swap", f"{request.memory_limit_mb}m",  # no swap headroom
         "--cpus", str(request.cpu_limit),
@@ -341,9 +352,15 @@ class ContainerSandboxRunner(SandboxRunner):
 
     isolation_mode = "container"
 
-    def __init__(self, runtime: str = "docker", network: str = "bridge"):
+    def __init__(
+        self,
+        runtime: str = "docker",
+        network: str = "bridge",
+        extra_hosts: list[str] | None = None,
+    ):
         self._runtime = runtime
         self._network = network
+        self._extra_hosts = extra_hosts or []
 
     def _image_for(self, request: SandboxRunRequest) -> str:
         # Convention set by the install pipeline.
@@ -396,6 +413,7 @@ class ContainerSandboxRunner(SandboxRunner):
             container_name=name,
             network=self._network,
             secrets_file=secrets_file,
+            extra_hosts=self._extra_hosts,
         )
         proc = await asyncio.create_subprocess_exec(
             *command,

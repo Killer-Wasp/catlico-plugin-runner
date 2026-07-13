@@ -63,6 +63,20 @@ Full walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
 Any other value is rejected at startup with an error naming the valid modes; the runner
 never silently falls back to an adapter you did not ask for.
 
+## End-to-end check
+
+[`e2e/`](e2e/README.md) is a reusable, plugin-agnostic end-to-end test: it feeds an
+observable to a plugin, lets it run all the way through the runner's container
+sandbox, and asserts the `PluginResult` that comes back (the row the web UI shows).
+
+```bash
+./e2e/start_runner.sh observable-validator   # scoped runner, container isolation
+python e2e/e2e_check.py observable-validator  # → ✓ PASS
+```
+
+Point it at any other plugin via `e2e/scenarios.json` or CLI flags — see
+[`e2e/README.md`](e2e/README.md).
+
 ## Documentation
 
 | Doc | What's in it |
@@ -70,6 +84,7 @@ never silently falls back to an adapter you did not ask for.
 | [Getting started](docs/getting-started.md) | Setup, enrollment, configuration table, providing plugins, known gaps |
 | [Enrollment](docs/enrollment.md) | The one-time token exchange, credentials, rotation, the restart trap |
 | [Security model](docs/security.md) | Trust boundary, endpoint auth, sandbox hardening, secrets handling |
+| [End-to-end check](e2e/README.md) | Reusable e2e: drive any plugin through the runner and assert its result |
 
 Contributors and AI agents: [`AGENTS.md`](AGENTS.md).
 

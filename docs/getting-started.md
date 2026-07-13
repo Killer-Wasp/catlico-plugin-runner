@@ -77,13 +77,15 @@ All settings use the `PLUGIN_RUNNER_` prefix (`plugin_runner/settings.py`):
 | `PLUGIN_RUNNER_RUNNER_ID` | `runner-1` | Stable runner id; must match the runner row created in Catlico |
 | `PLUGIN_RUNNER_NAME` | `Catlico Plugin Runner` | Display name reported at registration |
 | `PLUGIN_RUNNER_VERSION` | `0.1.0` | Version reported at registration |
-| `PLUGIN_RUNNER_CATLICO_API_URL` | `http://localhost:8000` | Catlico API base URL |
+| `PLUGIN_RUNNER_CATLICO_API_URL` | `http://localhost:8000` | Catlico API base URL, as reached by the **runner** |
+| `PLUGIN_RUNNER_PLUGIN_API_URL` | `""` | Catlico API base URL as reached by a **plugin sandbox**; empty reuses `CATLICO_API_URL`. Set it when a plugin container can't resolve the runner's URL — e.g. local container-isolation dev on Docker Desktop, where the API is on the host: `http://host.docker.internal:8000` |
 | `PLUGIN_RUNNER_ENROLLMENT_TOKEN` | `""` | One-time enrollment token; only consulted when no usable persisted credential exists |
 | `PLUGIN_RUNNER_STATE_FILE` | `.runner-state.json` | Owner-only (`0600`) cache of the enrolled credential + push secret; point at a persistent volume in containers |
 | `PLUGIN_RUNNER_PLUGIN_DIRS` | `[]` | Directories scanned for plugins (JSON list) |
 | `PLUGIN_RUNNER_ISOLATION_MODE` | `container` | `container` (hardened, the default) or `subprocess` (trusted dev only); anything else is rejected at startup |
 | `PLUGIN_RUNNER_CONTAINER_RUNTIME` | `docker` | Container runtime binary the container adapter shells out to (e.g. `podman`); ignored in `subprocess` mode |
 | `PLUGIN_RUNNER_CONTAINER_NETWORK` | `bridge` | `--network` value for the container adapter (`bridge`, `none`, or a named network); ignored in `subprocess` mode |
+| `PLUGIN_RUNNER_CONTAINER_EXTRA_HOSTS` | `[]` | Extra `--add-host` entries (JSON list of `"name:ip"`) for plugin containers. Empty by default: Docker Desktop resolves `host.docker.internal` natively. On **native Linux** set `["host.docker.internal:host-gateway"]` so a plugin can reach an API on the runner host; ignored in `subprocess` mode |
 | `PLUGIN_RUNNER_HOST` | `0.0.0.0` | Private API bind host |
 | `PLUGIN_RUNNER_PORT` | `8090` | Private API bind port |
 | `PLUGIN_RUNNER_HEARTBEAT_INTERVAL_SECONDS` | `30` | Heartbeat cadence to the API |

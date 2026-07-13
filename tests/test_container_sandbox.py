@@ -38,6 +38,7 @@ def test_command_has_security_flags():
     joined = " ".join(cmd)
     assert "--rm" in cmd
     assert "--network bridge" in joined
+    assert "--add-host" not in cmd  # none by default (Docker Desktop resolves the host)
     assert "--memory 128m" in joined
     assert "--memory-swap 128m" in joined  # no swap headroom
     assert "--cpus 0.5" in joined
@@ -47,6 +48,15 @@ def test_command_has_security_flags():
     assert "--user 65534:65534" in joined
     assert cmd[-3:] == ["python", "-m", "catlico_plugin_sdk._worker"]
     assert "catlico-plugin/acme:1.0.0" in cmd
+
+
+def test_extra_hosts_are_added_when_configured():
+    cmd = build_container_command(
+        _request(), image="catlico-plugin/acme:1.0.0", container_name="c1",
+        extra_hosts=["host.docker.internal:host-gateway"],
+    )
+    joined = " ".join(cmd)
+    assert "--add-host host.docker.internal:host-gateway" in joined
 
 
 def test_network_none_isolation():

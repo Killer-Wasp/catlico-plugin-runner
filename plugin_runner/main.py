@@ -49,7 +49,9 @@ def select_sandbox(settings: RunnerSettings) -> SandboxRunner:
         return SubprocessSandboxRunner()
     if settings.isolation_mode == "container":
         return ContainerSandboxRunner(
-            runtime=settings.container_runtime, network=settings.container_network
+            runtime=settings.container_runtime,
+            network=settings.container_network,
+            extra_hosts=settings.container_extra_hosts,
         )
     raise ValueError(
         f"invalid isolation_mode {settings.isolation_mode!r}; "
@@ -272,7 +274,7 @@ async def serve(
         client=client,
         registry=registry,
         runner_id=settings.runner_id,
-        api_base_url=settings.catlico_api_url,
+        api_base_url=settings.plugin_api_url or settings.catlico_api_url,
         sandbox=sandbox,
         sdk_source=settings.sdk_source,
         build_runtime=settings.container_runtime,

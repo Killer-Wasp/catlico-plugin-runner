@@ -61,6 +61,11 @@ def test_generate_dockerfile_is_non_root_and_installs_sdk():
     assert "pip install --no-cache-dir catlico-plugin-sdk" in dockerfile
     assert "ENTRYPOINT" not in dockerfile  # sandbox sets the command
     assert "python:3.14-slim" in dockerfile  # SDK/plugins require-python >=3.14
+    # Dependencies install from the uv lock, never requirements.txt.
+    assert "requirements.txt" not in dockerfile
+    assert "uv export --frozen" in dockerfile
+    assert "uv pip install --system" in dockerfile
+    assert "ghcr.io/astral-sh/uv" in dockerfile
 
 
 def test_generate_dockerfile_installs_staged_sdk():
@@ -120,7 +125,7 @@ def _plugin_dir(tmp_path: Path, *, lockfile=True) -> Path:
         timeout_seconds = 60
     """))
     if lockfile:
-        (d / "requirements.txt").write_text("httpx\n")
+        (d / "uv.lock").write_text("")
     return d
 
 
@@ -139,7 +144,7 @@ async def test_install_local_strict_requires_lockfile(tmp_path):
         _plugin_dir(tmp_path, lockfile=False), build=False, strict=True
     )
     assert result.status == STATE_FAILED
-    assert any("lockfile" in e for e in result.errors)
+    assert any("uv.lock" in e for e in result.errors)
 
 
 async def _record(states, s):
@@ -168,7 +173,7 @@ def _make_git_repo(tmp_path: Path) -> tuple[Path, str]:
         permissions = ["read:observable"]
         timeout_seconds = 60
     """))
-    (repo / "requirements.txt").write_text("httpx\n")
+    (repo / "uv.lock").write_text("")
     _git("add", "-A", cwd=repo)
     _git("commit", "-m", "initial", cwd=repo)
     sha = _git("rev-parse", "HEAD", cwd=repo).stdout.strip()
