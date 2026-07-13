@@ -26,6 +26,7 @@ from plugin_runner.client import PluginRunnerClient
 from plugin_runner.engine import dispatch_event
 from plugin_runner.installer import STATE_FAILED, STATE_INSTALLED, install_from_source
 from plugin_runner.metrics import REGISTRY as METRICS_REGISTRY
+from plugin_runner.metrics import set_installed_plugin_count
 from plugin_runner.registry import Registry
 from plugin_runner.sandbox import SandboxRunner, SubprocessSandboxRunner
 
@@ -135,10 +136,10 @@ def create_app(
         """Background install driver. Clones + builds under
         ``install_root/<plugin_id>`` and streams progress back to the API sink.
 
-        NOTE: this does NOT update the in-memory ``registry``, so a freshly
-        installed plugin is not yet discoverable/served by this running process —
-        a registry refresh / re-discovery (or a restart) is a deliberate
-        follow-up, out of scope for this endpoint."""
+        On a successful install the freshly built plugin is folded into the live
+        in-memory ``registry`` (see below), so this running process starts
+        dispatching to it immediately — no runner restart or re-discovery needed.
+        A failed install leaves the registry untouched."""
         target_dir = install_root / plugin_id
 
         async def on_state(state: str) -> None:
@@ -161,6 +162,25 @@ def create_app(
             logger.exception("install of %s raised", plugin_version_id)
             await _report_failed(plugin_version_id, str(exc))
             return
+
+        # Serve the new plugin without a restart: on success the pipeline hands
+        # back a loaded ``InstalledPlugin`` (the container image is already built,
+        # the cloned source is on disk for the subprocess adapter), so folding it
+        # into the registry makes ``dispatch_event`` and ``for_trigger`` see it on
+        # the very next event. ``registry.add`` overwrites by id, so a re-install
+        # / version bump replaces the prior entry rather than duplicating it.
+        # This is a plain dict write with no ``await`` before the read side in
+        # ``dispatch_event``, so a concurrent event sees the old-or-new registry
+        # atomically — never a half-updated one. A failed install (or a caller
+        # that returns no ``plugin``) leaves the registry as-is.
+        if result.status == STATE_INSTALLED and result.plugin is not None:
+            registry.add(result.plugin)
+            set_installed_plugin_count(len(registry.all()))
+            logger.info(
+                "registered plugin %s@%s from install — serving without restart",
+                result.plugin.id,
+                result.plugin.version,
+            )
 
         try:
             await client.report_install_status(

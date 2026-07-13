@@ -245,6 +245,143 @@ async def test_signed_install_drives_state_sequence():
     assert terminal["image_digest"] == "catlico-plugin/acme:1.0.0"
 
 
+async def test_successful_install_registers_plugin_for_dispatch():
+    """Closes the post-install registry-refresh gap: a freshly installed plugin
+    is served by the running process without a restart. On STATE_INSTALLED the
+    loaded InstalledPlugin is folded into the live registry, so ``for_trigger``
+    matches it on the very next event."""
+    cap = _CaptureClient()
+    spawned = []
+    registry = _registry()  # starts with just 'acme'
+    new_plugin = InstalledPlugin(
+        id="newbie", version="2.0.0",
+        manifest={"triggers": ["alert.created"]},
+        module="newbie.plugin", cls="Plugin", path="/installs/newbie/src",
+    )
+    result = InstallResult(
+        status=STATE_INSTALLED,
+        plugin=new_plugin,
+        commit_sha="a" * 40,
+        image_tag="catlico-plugin/newbie:2.0.0",
+    )
+    installer = _fake_installer(
+        ["cloning", "validating", "building", "installed"], result
+    )
+    app = create_app(
+        client=cap,
+        registry=registry,
+        runner_id="runner-1",
+        api_base_url="http://catlico:8000",
+        sandbox=_FakeSandbox(),
+        installer=installer,
+        spawn=lambda coro: spawned.append(coro),
+    )
+    client = TestClient(app)
+
+    # Before install: unknown to this process, not dispatchable.
+    assert "newbie" not in {p.id for p in registry.all()}
+    assert registry.for_trigger("alert.created") == []
+
+    body = json.dumps(
+        {
+            "plugin_version_id": "newbie@2.0.0",
+            "plugin_id": "newbie",
+            "source_url": "https://example.test/newbie.git",
+            "source_ref": "main",
+        }
+    ).encode()
+    r = client.post(
+        "/internal/plugins/install",
+        content=body,
+        headers={"x-catlico-signature": sign_body(body, PUSH_SECRET)},
+    )
+    assert r.status_code == 202
+    await spawned[0]
+
+    # After install: served without a restart — in the registry and matched by
+    # its declared trigger, and the health/heartbeat count reflects it.
+    assert [p.id for p in registry.for_trigger("alert.created")] == ["newbie"]
+    assert {p.id for p in registry.all()} == {"acme", "newbie"}
+
+
+async def test_failed_install_does_not_register_plugin():
+    """A failed install must never become servable, even if a defensive
+    InstalledPlugin rides along on the failed result."""
+    cap = _CaptureClient()
+    spawned = []
+    registry = _registry()
+    result = InstallResult(
+        status=STATE_FAILED,
+        plugin=InstalledPlugin(
+            id="newbie", version="2.0.0",
+            manifest={"triggers": ["alert.created"]},
+            module="newbie.plugin", cls="Plugin", path="/p",
+        ),
+        errors=["image build failed"],
+    )
+    installer = _fake_installer(["cloning", "validating", "building"], result)
+    app = create_app(
+        client=cap,
+        registry=registry,
+        runner_id="runner-1",
+        api_base_url="http://catlico:8000",
+        sandbox=_FakeSandbox(),
+        installer=installer,
+        spawn=lambda coro: spawned.append(coro),
+    )
+    client = TestClient(app)
+
+    r = client.post(
+        "/internal/plugins/install",
+        content=_INSTALL_BODY,
+        headers={"x-catlico-signature": sign_body(_INSTALL_BODY, PUSH_SECRET)},
+    )
+    assert r.status_code == 202
+    await spawned[0]
+
+    # Registry unchanged: only the original 'acme' is served.
+    assert {p.id for p in registry.all()} == {"acme"}
+
+
+async def test_reinstall_replaces_registry_entry_without_duplicating():
+    """A re-install / version bump overwrites the existing registry entry (keyed
+    by id) rather than adding a second one."""
+    cap = _CaptureClient()
+    spawned = []
+    registry = _registry()  # 'acme' @ 1.0.0
+    upgraded = InstalledPlugin(
+        id="acme", version="1.1.0",
+        manifest={"triggers": ["observable.created"]},
+        module="acme.plugin", cls="Plugin", path="/installs/acme/src",
+    )
+    result = InstallResult(
+        status=STATE_INSTALLED, plugin=upgraded, image_tag="catlico-plugin/acme:1.1.0"
+    )
+    installer = _fake_installer(["cloning", "validating", "installed"], result)
+    app = create_app(
+        client=cap,
+        registry=registry,
+        runner_id="runner-1",
+        api_base_url="http://catlico:8000",
+        sandbox=_FakeSandbox(),
+        installer=installer,
+        spawn=lambda coro: spawned.append(coro),
+    )
+    client = TestClient(app)
+
+    r = client.post(
+        "/internal/plugins/install",
+        content=_INSTALL_BODY,
+        headers={"x-catlico-signature": sign_body(_INSTALL_BODY, PUSH_SECRET)},
+    )
+    assert r.status_code == 202
+    await spawned[0]
+
+    all_plugins = registry.all()
+    assert len(all_plugins) == 1  # not duplicated
+    assert all_plugins[0].version == "1.1.0"  # replaced with the new version
+
+
 async def test_install_reports_failed_when_installer_returns_failed():
     cap = _CaptureClient()
     spawned = []
