@@ -3,6 +3,7 @@ name = "catlico-plugin-runner"
 version = "0.1.0"
 description = "Plugin runner service: hosts plugins, distributes events, manages sandbox execution."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.14"
 dependencies = [
     "catlico-plugin-sdk",

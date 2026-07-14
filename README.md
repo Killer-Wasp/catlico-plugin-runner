@@ -3,7 +3,7 @@
 **The sandbox host for [Catlico](https://github.com/jimmyruann/catlico-backend) plugins —
 executes third-party code without ever holding database credentials.**
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/)
 
 The runner is a low-privilege control-plane worker. The Catlico API tells it what to run; it
@@ -107,4 +107,4 @@ runtime and network are hardcoded to `docker`/`bridge`. The gaps are listed hone
 
 ## License
 
-[GNU Affero General Public License v3.0](LICENSE).
+[MIT License](LICENSE).
