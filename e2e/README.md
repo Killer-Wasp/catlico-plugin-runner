@@ -1,12 +1,12 @@
 # Plugin runner — end-to-end check (reusable)
 
 A repeatable, **plugin-agnostic** end-to-end test: feed an observable to a plugin,
-let it run all the way through the runner's sandbox, and assert the `PluginResult`
-that comes back — the exact row the web UI's **Plugin Results** panel displays.
+let it run all the way through the runner, and assert the `PluginResult` that comes
+back — the exact row the web UI's **Plugin Results** panel displays.
 
 ```
 create observable → observable.created → API HMAC-push to the runner
-→ runner claims a run → plugin executes in a sandbox (container by default)
+→ runner claims a run → plugin executes in a subprocess (its own per-plugin venv)
 → ctx.api writes a PluginResult over the runtime API
 → e2e_check.py polls the result and asserts it
 ```
@@ -24,13 +24,13 @@ base URL, so a fake substitutes at every level:
 | Layer | Command | Stack needed | Proves |
 |---|---|---|---|
 | Plugin logic (`catlico-plugins/<p>/tests/test_parity.py`) | `uv run pytest` | none | verdict/taxonomy from mocked vendor responses |
-| **Hermetic sandbox** (`tests/test_sandbox_fake_api_e2e.py`) | `uv run pytest` | none (fake runtime API) | the plugin really executes in a sandbox and POSTs a well-formed result — **no API/DB/Docker** |
+| **Executor** (`tests/test_executor.py`) | `uv run pytest` | none | a real `main.py` Catlico app runs in a subprocess via the SDK worker |
 | Runner dispatch (`tests/test_engine.py`) | `uv run pytest` | none (mocked client) | claim/dispatch orchestration |
-| **Full e2e** (`e2e/e2e_check.py`, this dir) | see below | API + DB + runner + Docker | the real dispatch → sandbox → persistence loop |
+| **Full e2e** (`e2e/e2e_check.py`, this dir) | see below | API + DB + runner | the real dispatch → subprocess → persistence loop |
 
-The hermetic sandbox test is the "run it for real without the API" answer: it points
-a plugin's `ctx.api` at a ~40-line stdlib HTTP stub and runs it through the real
-subprocess sandbox. Use the full e2e below only to confirm the real control plane.
+The executor tests are the "run it for real without the API" answer: they run a real
+`Catlico` app through the SDK worker in a subprocess. Use the full e2e below only to
+confirm the real control plane.
 
 ## Files
 
@@ -38,16 +38,14 @@ subprocess sandbox. Use the full e2e below only to confirm the real control plan
 |---|---|
 | `e2e_check.py`   | the reusable checker (stdlib only). `python e2e/e2e_check.py <plugin-id>` |
 | `scenarios.json` | per-plugin scenarios: observable to feed, config/secrets, what to assert |
-| `start_runner.sh`| start a runner scoped to the plugin(s) under test, container isolation |
+| `start_runner.sh`| start a runner scoped to the plugin(s) under test (per-plugin venv, no sandbox) |
 | `README.md`      | this file |
 
 ## Prerequisites (one-time per session)
 
-Docker running, plus:
+`uv` on PATH (the runner syncs a venv per scoped plugin), plus:
 
-### 1. API — reachable *from inside a container*
-
-`make dev` binds `127.0.0.1`, which a plugin container cannot reach. Bind `0.0.0.0`:
+### 1. API — reachable from the runner
 
 ```bash
 cd catlico-api
@@ -55,7 +53,7 @@ set -a; . ./.env; set +a
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-### 2. Runner — scoped to the plugin(s) under test, container isolation
+### 2. Runner — scoped to the plugin(s) under test
 
 ```bash
 cd catlico-plugin-runner
@@ -63,34 +61,25 @@ cd catlico-plugin-runner
 ./e2e/start_runner.sh observable-validator ip-api     # several
 ```
 
-The runner builds one image per scoped plugin, enrolls, and registers them with the
-API. On the **first** enroll (or after a reset) pass a one-time token:
+The runner syncs one venv per scoped plugin, self-registers (shared secret — no
+enrollment token), and reports them to the API. Set `PLUGIN_RUNNER_SHARED_SECRET`
+(same value as the API) in the runner's `.env` first:
 
 ```bash
-ENROLL_TOKEN=cpe_xxx ./e2e/start_runner.sh observable-validator
+./e2e/start_runner.sh observable-validator
 ```
 
-Mint a token in Catlico as superadmin: `POST /api/v1/plugin-runners` (new runner) or
-`POST /api/v1/plugin-runners/{id}/re-enroll` (existing). Wait for
-`<plugin>: installed` and `POST …/register 200` (first enroll) or `resumed runner …`
-(later) in the runner log.
-
-> **Adding a plugin the runner hasn't registered before requires a re-enroll** — the
-> runner only reports its plugin set to the API when it enrolls, not on a plain
-> resume. So to add `ip-api` to an already-running runner: re-enroll, then
-> `start_runner.sh observable-validator ip-api` with the fresh `ENROLL_TOKEN`.
+Wait for `provisioned N plugin(s)` and `registered runner …` in the runner log. Adding
+a plugin the runner hasn't seen before is just a restart with it in the scoped set (the
+runner reports its plugin set on every self-registration).
 
 ### 3. Web (optional, for eyeballing) — `cd catlico-web && pnpm dev` → http://localhost:3000
 
-### Networking notes
+### Networking note
 
-- Plugin containers reach the host API via `host.docker.internal`
-  (`PLUGIN_RUNNER_PLUGIN_API_URL`, default `http://host.docker.internal:8000`).
-  Docker Desktop resolves that name automatically.
-- On **native Linux**, also export
-  `PLUGIN_RUNNER_CONTAINER_EXTRA_HOSTS='["host.docker.internal:host-gateway"]'`
-  before `start_runner.sh` (Docker Desktop must NOT set this — there it breaks the
-  built-in name).
+- The plugin subprocess reaches the API at `PLUGIN_RUNNER_PLUGIN_API_URL` (empty →
+  reuses `PLUGIN_RUNNER_CATLICO_API_URL`). Since there is no container, `localhost`
+  works — no `host.docker.internal` needed.
 
 ## Run the check
 
@@ -174,6 +163,6 @@ docker exec catlico-api-db-1 psql -U catlico -d catlico -x -c \
 |---|---|
 | `plugin … not registered` | runner isn't up, or isn't scoped to this plugin — `start_runner.sh <id>` (re-enroll to register a new one) |
 | `available=false` | no healthy runner hosts it — check the runner log / heartbeat |
-| `error_kind=bug`, `ConnectError: All connection attempts failed` | plugin container can't reach the API — API not on `0.0.0.0`, or `PLUGIN_RUNNER_PLUGIN_API_URL` / `host.docker.internal` not resolving |
+| `error_kind=bug`, `ConnectError: All connection attempts failed` | the plugin can't reach the API — check `PLUGIN_RUNNER_PLUGIN_API_URL` (or `PLUGIN_RUNNER_CATLICO_API_URL`) points at a running API |
 | `error_kind=timeout` | plugin exceeded `timeout_seconds` (slow vendor) — raise the timeout or pick a faster target |
 | `config_complete=false` | a required secret/setting is missing — add it via `secrets_env` / `--secret` |

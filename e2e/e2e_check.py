@@ -2,12 +2,12 @@
 """Reusable end-to-end check: drive ANY plugin through the runner and assert it.
 
 Proves the full loop for one plugin: create an entity (observable), let Catlico
-dispatch ``<trigger>`` to the runner, have the runner execute the plugin in its
-sandbox, and assert the ``PluginResult`` that comes back — the same row the web
-UI's **Plugin Results** panel displays.
+dispatch ``<trigger>`` to the runner, have the runner execute the plugin in a
+subprocess bound to its per-plugin venv, and assert the ``PluginResult`` that comes
+back — the same row the web UI's **Plugin Results** panel displays.
 
     create observable → observable.created → API HMAC-push → runner claims a run
-    → plugin runs in a sandbox (container by default) → ctx.api writes a result
+    → plugin runs in a subprocess (its own venv python) → ctx.api writes a result
     → this script asserts it.
 
 It is **plugin-agnostic**: a scenario names the plugin, the observable to feed it,

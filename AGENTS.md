@@ -10,9 +10,11 @@
 
 ## What this is
 
-`catlico-plugin-runner` hosts and executes third-party plugins. It is a low-privilege
-control-plane worker: the Catlico API tells it what to run; it runs each plugin in an
-isolated sandbox and reports the outcome back over the internal API.
+`catlico-plugin-runner` hosts and executes first-party plugins. It is a low-privilege
+control-plane worker: it hosts a `/plugins` directory of per-plugin uv projects, gives each its
+own dependency venv (keyed by `sha256(uv.lock)`), and runs every event as a plain subprocess
+bound to that venv. The Catlico API tells it what to run; it reports outcomes back over the
+internal API. **There is no sandbox** — plugins are trusted first-party code (see security.md).
 
 It is the intended successor to `catlico-konnect`, which remains the production
 connector worker until the migration completes. Prefer adding new integrations as
@@ -29,26 +31,28 @@ Every rule below is load-bearing. Breaking one collapses the isolation model.
   identically on the runner and the API. It never holds a browser user's session.
 - **Browsers never reach it.** Its `/internal/*` surface is called only by the Catlico
   API host. Put it on a private network; never expose it publicly.
-- **Plugins never run in the runner process.** Every run is a separate process or a
-  throwaway container. Plugin code is never imported into the long-lived runner.
+- **Plugins never run in the runner process.** Every run is a separate subprocess bound to the
+  plugin's own venv python. Plugin code is never imported into the long-lived runner.
 
 ## Stack
 
-**Python 3.14**, **uv**, **FastAPI** (private API), **httpx**. Depends on the sibling
-path package `../catlico-plugin-sdk`, so the Docker build context must be the **repo root**.
+**Python 3.14**, **uv** (shelled out to for venv syncs — must be on PATH), **Starlette** (private
+API), **httpx**. Depends on the sibling path package `../catlico-plugin-sdk` (editable), so the
+Docker build context must be the **repo root**.
 
 ## Layout
 
 ```
 plugin_runner/
-  main.py        # entrypoint: self-register, heartbeat loop, serve private API
-  server.py      # the four /internal/* routes
+  main.py        # entrypoint + CLI (serve/sync/install); uv preflight, provision, register
+  server.py      # /internal/* routes (health, plugins, events, rescan, cancel, /metrics)
   client.py      # Catlico internal API client (register, claim, submit)
-  registry.py    # discovers plugin dirs containing catlico-plugin.toml
-  sandbox.py     # SubprocessSandboxRunner + ContainerSandboxRunner
-  engine.py      # run orchestration
-  installer.py   # manifest/lockfile checks + per-plugin image builds (ensure_images runs at startup)
-  settings.py    # PLUGIN_RUNNER_* settings
+  registry.py    # discovers /plugins; manifest validation + _ALLOWED_PERMISSIONS + SDK gate
+  venvs.py       # per-plugin venv provisioning (sha256(uv.lock) marker skip, gc, ensure_all)
+  executor.py    # PluginExecutor / SubprocessExecutor (RunRequest/RunResult, redaction)
+  gitclone.py    # hardened clone_source used by `plugin-runner install <git-url>`
+  engine.py      # run orchestration (claim -> execute -> report; quarantine)
+  settings.py    # PLUGIN_RUNNER_* settings + default_cache_root()
 ```
 
 ## Authentication and self-registration
@@ -57,10 +61,11 @@ Auth is **one shared secret** (`PLUGIN_RUNNER_SHARED_SECRET`) configured identic
 runner and the Catlico API — the whole trust boundary. There is no token exchange, no minted
 credential, and nothing persisted to disk.
 
-On startup the runner constructs its API client directly from the shared secret and runner id,
-then calls `register()` **once** to self-announce — reporting its `PLUGIN_RUNNER_ADVERTISED_URL`
-(the URL the API uses to reach it for event/install pushes) and its installed plugin manifests.
-The container-runtime preflight runs *before* registration. There is no token to spend, no
+On startup the runner runs a **`uv` preflight** (refuses to start if uv is unusable — every venv
+sync would fail), discovers + provisions plugin venvs, then constructs its API client directly
+from the shared secret and runner id and calls `register()` **once** — reporting its
+`PLUGIN_RUNNER_ADVERTISED_URL` (the URL the API uses to reach it for event pushes), a constant
+`isolation_mode = "subprocess"`, and its plugin manifests. There is no token to spend, no
 credential cache, and no re-enrollment recovery.
 
 Every runner→API request carries:
@@ -73,8 +78,8 @@ X-Runner-Id: <runner_id>
 > **Rotation.** Change `PLUGIN_RUNNER_SHARED_SECRET` on the API and every runner to the new
 > value and restart both sides together. A wrong secret means every call is simply rejected.
 >
-> Note: the per-run `runtime_token` (plugin sandbox → API) is a separate, unchanged concern —
-> do not conflate it with the runner shared secret.
+> Note: the per-run `runtime_token` (plugin → API) is a separate, unchanged concern — do not
+> conflate it with the runner shared secret.
 
 ## Private endpoints
 
@@ -82,95 +87,80 @@ Served on `PLUGIN_RUNNER_HOST:PLUGIN_RUNNER_PORT` (default `0.0.0.0:8090`).
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/internal/health` | none | Liveness, `runner_id`, plugin count, isolation mode |
-| GET | `/internal/plugins` | none | Installed plugins + manifests |
-| POST | `/internal/events` | **HMAC** | One event envelope; dispatched to matching plugins |
-| POST | `/internal/runs/{run_id}/cancel` | none | Stub; returns `{"run_id": …, "cancelled": true}` |
+| GET | `/internal/health` | none | Liveness, `runner_id`, plugin count, `isolation_mode` (`"subprocess"`) |
+| GET | `/internal/plugins` | none | Plugins + `status`/`error` + manifests |
+| POST | `/internal/events` | **HMAC** | One event envelope; dispatched to matching ready plugins |
+| POST | `/internal/plugins/rescan` | **HMAC** | Re-discover + re-sync + `replace_all` (202). Implemented, **unwired** from API/web |
+| POST | `/internal/runs/{run_id}/cancel` | none | Stub; returns `{"cancelled": true}` |
+| GET | `/metrics` | none | Prometheus text (private-network scrape) |
 
-Only `/internal/events` is authenticated. The API signs the **raw request body**:
+The signed routes verify `x-catlico-signature: sha256=<hmac-sha256(shared_secret, raw_body)>`
+in constant time; a missing/bad signature returns `401`. Unauthenticated routes are guarded only
+by the private network.
 
-```
-x-catlico-signature: sha256=<hex hmac-sha256(shared_secret, raw_body)>
-```
+## Execution model — no sandbox
 
-The runner recomputes and compares in constant time; a missing/empty secret or bad
-signature returns `401`. `health` and `plugins` are unauthenticated — **the private
-network is the only control on them.**
+There is **one** execution adapter: `SubprocessExecutor` (in `executor.py`). Each run is
+`python -m catlico_plugin_sdk._worker` run with **the plugin's own venv python**
+(`RunRequest.python_executable`) in its own process **group** (`start_new_session=True`); on
+timeout the group is `SIGKILL`ed. The environment is inherited (plugins may need PATH/awscli/AWS
+creds). Plugins are trusted first-party code — no container, no resource caps. The executor
+boundary is kept clean (plugin code never imported into the runner) so a container/bwrap adapter
+could slot in later. The worker writes its result JSON to a `result_path` temp file.
 
-`/internal/health` reports the active adapter's real `isolation_mode`.
-
-## Isolation modes
-
-Chosen by `PLUGIN_RUNNER_ISOLATION_MODE`. The shipped default is **`container`**; any
-value other than `container`/`subprocess` is rejected at startup (`select_sandbox`) —
-never silently mapped to an adapter.
-
-- **`container`** (default) — untrusted-mode adapter. One single-use container per run,
-  image `catlico-plugin/<plugin_id>:<version>`; missing images are built at startup by
-  `installer.ensure_images` (broken plugins are logged and skipped, never fatal). The
-  runner preflights the container runtime and **refuses to start** if it is unusable.
-  Runtime is hardcoded to `docker` and the network to `bridge`; neither is configurable.
-- **`subprocess`** — trusted-mode dev adapter, explicit opt-in. Runs
-  `python -m catlico_plugin_sdk._worker` in its own process **group**
-  (`start_new_session=True`); on timeout the group is `SIGKILL`ed. **The plugin runs on
-  the host with the runner's own privileges — no isolation.**
-
-Container hardening (`build_container_command`): `--rm -i`, `--network bridge`,
-`--memory`/`--memory-swap` (no swap headroom), `--cpus`, `--pids-limit 256`,
-`--read-only`, `--tmpfs /tmp:rw,size=64m`, `--cap-drop ALL`,
-`--security-opt no-new-privileges`, `--user 65534:65534`.
-
-The worker prints its result JSON on stdout behind a `__CATLICO_RESULT__` sentinel
-line; the runner splits that from the plugin's log output.
+**Per-plugin venvs** (`venvs.py`): keyed by `sha256(uv.lock)` (`venv_dir_name = <id>-<sha12>`);
+a `.catlico-venv-ok` marker records `{lock_sha256, sdk_source}` and is written only on full
+success. Matching marker → **zero uv calls** (warm start). Else `uv sync --frozen --no-dev` with
+`UV_PROJECT_ENVIRONMENT`/`UV_CACHE_DIR` overlaid on `os.environ`. Failures keep the markerless
+partial dir (self-repair) and quarantine the plugin, never crash the runner. `gc_stale` runs at
+**startup only** (never on rescan). `run_uv` is injectable for tests.
 
 ## Timeouts, logs, secrets
 
-- **Timeout** comes from the plugin manifest's `timeout_seconds` (default 60). On expiry
-  the run is killed (process-group `SIGKILL`, or `docker kill`) and recorded as
-  `status = timeout`, `error_kind = timeout`.
-- **Log tail** is truncated to the last 64 KB (`LOG_TAIL_MAX_BYTES`).
-- **Secrets** are fetched per-run from the API and passed to the worker. The log tail is
-  **secret-redacted before truncation** (`sandbox._redact`): run-secret values and the run
-  token become `***REDACTED***` on every terminal path, in both adapters. It is a backstop —
-  encoded/transformed secrets pass through, and values shorter than `MIN_SECRET_LEN` are
-  skipped — so plugins still must not print secrets.
+- **Timeout**: manifest `timeout_seconds` (default 60). On expiry the process group is
+  `SIGKILL`ed; recorded as `status = timeout`, `error_kind = timeout`.
+- **Log tail** truncated to the last 64 KB (`LOG_TAIL_MAX_BYTES`).
+- **Secrets** are fetched per-run from the API. The log tail is **secret-redacted before
+  truncation** (`executor._redact`): run-secret values and the run token become `***REDACTED***`
+  on every terminal path, in raw + common encoded forms. Backstop only — transformed secrets can
+  pass through; plugins must not print secrets.
 
 ## Configuration
 
-All settings use the `PLUGIN_RUNNER_` prefix (`settings.py`): `RUNNER_ID` (default
-`runner-1`, stable id for this runner), `NAME`, `VERSION`, `CATLICO_API_URL`,
-`SHARED_SECRET` (auth secret; must match the API's value), `ADVERTISED_URL` (URL the API
-uses to reach this runner, self-reported at registration), `PLUGIN_DIRS` (JSON list),
-`ISOLATION_MODE` (default `container`), `HOST`, `PORT`,
-`HEARTBEAT_INTERVAL_SECONDS`, `HTTP_TIMEOUT`.
+`PLUGIN_RUNNER_` prefix (`settings.py`): `RUNNER_ID`, `NAME`, `VERSION`, `CATLICO_API_URL`,
+`PLUGIN_API_URL`, `SHARED_SECRET`, `ADVERTISED_URL`, `PLUGINS_DIR` (default `/plugins`),
+`VENVS_DIR`, `UV_CACHE_DIR`, `SDK_SOURCE` (dev editable SDK), `UV_SYNC_TIMEOUT_SECONDS`,
+`VENV_SYNC_CONCURRENCY`, `HOST`, `PORT`, `HEARTBEAT_INTERVAL_SECONDS`, `HTTP_TIMEOUT`. Internal
+index / wheelhouse settings are plain uv env passthrough (`UV_DEFAULT_INDEX`, `UV_INDEX_*`,
+`UV_FIND_LINKS`, `UV_NATIVE_TLS`, `UV_OFFLINE`). Full table + registry/wheelhouse notes in
+`docs/getting-started.md`.
 
-The runner authenticates with `PLUGIN_RUNNER_SHARED_SECRET`, held in the environment and
-never cached to disk. There is **no Prometheus `/metrics` endpoint.**
+## CLI
+
+`plugin-runner serve` (default) · `plugin-runner sync` (provision all venvs, non-zero on any
+failure) · `plugin-runner install <source> [--ref REF] [--name NAME]` (copy a local dir / clone
+a git repo into `PLUGINS_DIR`; build-time/dev only).
 
 ## Known gaps — do not assume these work
 
-- **GitHub clone install is not implemented.** A `cloning` state constant exists but is
-  never used. Only local / Docker-volume installs work: mount plugin directories and
-  point `PLUGIN_RUNNER_PLUGIN_DIRS` at them. (`installer.ensure_images` *is* wired —
-  `main.py` builds missing per-plugin images at startup.)
-- **`/internal/plugins/{id}/resources/{path}` does not exist**, though the API proxies
-  to it. Those calls hit a nonexistent route and return the proxy's 502 wrapper.
+- **`POST /internal/plugins/rescan` is implemented but unwired** — no API proxy route or web
+  button calls it; rescan is restart-only for operators in this pass.
+- **No resource caps** — a runaway plugin can OOM the host; timeout kill is the only backstop.
 - **Cancel is a stub** that always reports success.
 
 ## Development
 
 ```bash
-make install   # uv sync (incl. dev group)
-make run       # self-register, heartbeat, serve private API on :8090
-make dev       # same, auto-restart on runner/SDK changes
-make test      # uv run pytest
-make build     # docker build (context is the repo root)
+make install          # uv sync (incl. dev group; SDK path source is editable)
+make run              # provision venvs, self-register, heartbeat, serve on :8090
+make dev              # same, auto-restart on runner/SDK changes
+make test             # uv run pytest (fast + slow real-uv tests)
+uv run pytest -m "not slow"   # skip the real-uv venv/isolation tests
+make build            # docker build (context is the repo root; bakes the catalog)
 ```
 
-Tests are Docker-optional: container-security tests are guarded by
-`skipif(not shutil.which("docker"))` and skip cleanly; command construction, sentinel
-parsing, manifest validation, Dockerfile generation, subprocess execution, and
-registration all run without Docker.
+Tests need no Docker. `@pytest.mark.slow` tests exercise real `uv` venv creation (including the
+StackStorm host-site-packages isolation proof) and skip cleanly when uv is unavailable.
 
 ## Related
 

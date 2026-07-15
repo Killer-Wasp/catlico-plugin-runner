@@ -1,117 +1,100 @@
 # Security model
 
-The runner exists to execute code you did not write. Everything below is load-bearing —
-breaking one rule collapses the isolation model.
+**The runner executes trusted first-party code with the runner's own privileges. There is no
+sandbox.** This is a deliberate design decision (see below), not a gap. The controls here are
+about *trust, integrity, and blast radius* — not containment of hostile code.
 
-## The trust boundary
+## The trust model — read this first
 
-- **No database access.** The runner never touches Postgres. Every state change — runs, results,
-  plugin inventory — goes through the Catlico internal API.
-- **No public user tokens.** It authenticates with a single shared secret configured
-  identically on the runner and the API. It never holds a browser user's session.
+- **Plugins run with the runner's privileges.** Each run is a plain subprocess bound to the
+  plugin's own venv interpreter. It inherits the runner's environment and can read the runner's
+  filesystem, reach the network, and shell out (awscli, external tooling on PATH) — because
+  legitimate SOC plugins need to. There are **no resource caps, no read-only rootfs, no dropped
+  capabilities, no container**.
+- **Therefore: install only code you have reviewed.** The whole security posture rests on this.
+  A malicious or compromised plugin is RCE on the runner host. Install is a **build-time** action
+  from reviewed source (see below) — never a runtime/web action — precisely so review is a
+  mandatory step, not an afterthought (the ComfyUI/Home-Assistant supply-chain postmortems are
+  the cautionary tale).
+- **Why no sandbox?** Plugins are first-party, reviewed code, and a real sandbox that still lets
+  them shell out to arbitrary tooling is not a sandbox. Container/bwrap isolation is a conscious
+  *future* upgrade path for third-party plugins — the executor keeps a clean boundary (one
+  `PluginExecutor` interface, plugin code is never imported into the runner) so an adapter can
+  slot in later without touching the rest of the runner.
+
+What the subprocess model *does* give you — as execution mechanics, not a containment boundary:
+
+- **Crash isolation.** A plugin runs in its own process, never in the long-lived runner; a
+  segfault or `sys.exit` can't take the runner down.
+- **Timeout kill.** Each run has its own process group (`start_new_session=True`); on
+  `timeout_seconds` expiry the whole group is `SIGKILL`ed. This is the *only* backstop against a
+  runaway plugin — a plugin that burns CPU/RAM within its timeout can still OOM the host.
+- **Dependency isolation.** The plugin runs on its *own venv* interpreter, so its dependencies
+  come solely from that venv — the runner's site-packages are never on the plugin's path (the
+  StackStorm host-fallback bug is impossible by construction; there is a test that proves it).
+- **Secret-redacted log tails.** Protects *stored* logs, below.
+
+## The trust boundary (still enforced)
+
+- **No database access.** The runner never touches Postgres. Every state change goes through the
+  Catlico internal API.
+- **No public user tokens.** It authenticates with a single shared secret configured identically
+  on the runner and the API. It never holds a browser user's session.
+- **Per-run scope.** Each run gets a short-lived `run_token` carrying only the plugin's manifest
+  permissions; the API rejects any call outside them. With no sandbox, **this per-run token +
+  manifest permission scope is the containment boundary** — so permission validation at discovery
+  is kept STRICT (a plugin requesting an unknown permission fails to load).
 - **Browsers never reach it.** Its HTTP surface is a private `/internal/*` API called only by the
   Catlico API host. **Put it on a private network. Do not expose it publicly.**
-- **Plugins never run in the runner process.** Each run executes in a separate process
-  (subprocess adapter) or a throwaway container (container adapter). Plugin code is never
-  imported into the long-lived runner.
+
+## Install is build-time, from reviewed source
+
+Plugins are provisioned into `PLUGIN_RUNNER_PLUGINS_DIR` (default `/plugins`) — a baked image
+layer, a volume/EFS mount, or `plugin-runner install <source>` at build stage. **There is no
+runtime/web install path.** The default image bakes the full reviewed catalog. A custom image is
+`FROM catlico/plugin-runner` + `RUN plugin-runner install <git-url> --ref <ref> && plugin-runner
+sync`. Integrity is tamper-evident via the per-plugin directory `commit_sha` fingerprint; a
+signed-manifest check is the clean future upgrade (integrity/provenance ≠ sandbox).
+
+## SDK-version gate
+
+Each plugin's manifest declares an `sdk` range. At discovery the runner refuses (quarantines) a
+plugin whose range excludes the bundled `catlico_plugin_sdk` version, so an SDK-API break fails
+loudly at load, not mid-run.
 
 ## Endpoint authentication
 
 | Path | Auth |
 |---|---|
 | `POST /internal/events` | **HMAC** over the raw body |
+| `POST /internal/plugins/rescan` | **HMAC** over the raw body (implemented; unwired from API/web) |
 | `GET /internal/health` | none |
 | `GET /internal/plugins` | none |
 | `POST /internal/runs/{id}/cancel` | none |
+| `GET /metrics` | none (Prometheus-conventional) |
 
-Three of the four routes are unauthenticated. **Network isolation is the only control on them.**
-`/internal/plugins` discloses your installed plugin inventory and manifests; `/internal/health`
-discloses the runner id and plugin count. Neither exposes secrets, but neither should be
-reachable from the internet.
-
-See [enrollment.md](enrollment.md) for the shared-secret model and the HMAC scheme.
-
-## Isolation modes
-
-Selected by `PLUGIN_RUNNER_ISOLATION_MODE`. The shipped default is **`container`**.
-
-> `subprocess` is an explicit opt-in for trusted local development and provides **no
-> isolation** — the plugin runs on the host with the runner's own privileges. Any value
-> other than `container` or `subprocess` is rejected at startup rather than silently
-> falling back. When `container` is selected but the container runtime is unusable, the
-> runner **refuses to start**: a runner that started degraded would report healthy and
-> then fail every run it claimed.
-
-### `subprocess` — trusted mode
-
-Each run executes `python -m catlico_plugin_sdk._worker` in its own process **group**
-(`start_new_session=True`). On timeout the whole group is `SIGKILL`ed.
-
-**The plugin runs on the host with the runner's own privileges.** It can read the runner's
-filesystem and environment. Use this only for plugins you wrote or audited. It is a development
-adapter.
-
-### `container` — untrusted mode (the default)
-
-Each run is a single-use container built for that plugin, from the image
-`catlico-plugin/<plugin_id>:<version>`. The runner builds any missing per-plugin images at
-startup (`ensure_images`); a plugin whose image can't be built is logged and skipped, never
-fatal.
-
-The runtime is hardcoded to `docker` and the network to `bridge`. Neither is configurable today.
-
-`build_container_command` produces this `docker run` line:
-
-| Flag | Effect |
-|---|---|
-| `--rm -i` | Single-use container, stdin piped in |
-| `--network bridge` | Normal bridge — the plugin must reach the Catlico API. `none` would fully isolate it |
-| `--memory <n>m` / `--memory-swap <n>m` | Hard memory cap with **no swap headroom** |
-| `--cpus <n>` | CPU cap |
-| `--pids-limit 256` | Process-count cap (fork-bomb guard) |
-| `--read-only` | Read-only root filesystem |
-| `--tmpfs /tmp:rw,size=64m` | The only writable path, 64 MB |
-| `--cap-drop ALL` | Drops every Linux capability |
-| `--security-opt no-new-privileges` | Blocks privilege escalation |
-| `--user 65534:65534` | Runs as `nobody`, never root |
-
-The container runs `python -m catlico_plugin_sdk._worker`. The worker emits its result JSON on
-stdout behind a `__CATLICO_RESULT__` sentinel line; the runner splits that from the plugin's log
-output.
+The unauthenticated routes disclose the plugin inventory (with status/error), the runner id, and
+metrics — no secrets, but **network isolation is the only control on them**. See
+[enrollment.md](enrollment.md) for the shared-secret model and HMAC scheme.
 
 ## Timeouts
 
-`timeout_seconds` comes from the plugin's manifest (default 60). On expiry the run is killed —
-process-group `SIGKILL`, or `docker kill <name>` — and recorded as `status = timeout`,
-`error_kind = timeout`.
+`timeout_seconds` comes from the plugin's manifest (default 60). On expiry the run's process group
+is `SIGKILL`ed and recorded as `status = timeout`, `error_kind = timeout`.
 
 ## Secrets
 
 Run config and secrets are fetched **per-run** from the API (`GET /runs/{id}/config`) and passed
 to the worker. The API only serves them while the run is `accepted` or `running`.
 
-> **Secrets are redacted from the log tail** before it leaves the sandbox, on every terminal
-> path (success, failure, timeout, kill) and in both adapters. Every run-secret value and the
-> run token are replaced with `***REDACTED***`. Redaction runs *before* the 64 KB truncation,
-> so a secret straddling the cut cannot survive as a partial. Values shorter than
-> `MIN_SECRET_LEN` are skipped — redacting `""` or `"1"` would corrupt the log without
-> protecting a credential.
+> **Secrets are redacted from the log tail** on every terminal path (success, failure, timeout,
+> kill). Every run-secret value and the run token are replaced with `***REDACTED***`, in raw and
+> common encoded forms (base64, URL-encoding). Redaction runs *before* the 64 KB truncation so a
+> secret straddling the cut cannot survive as a partial. Values shorter than `MIN_SECRET_LEN` are
+> skipped — redacting `""` or `"1"` would corrupt the log without protecting a credential.
 >
-> This is a backstop, not a licence. Plugins should still avoid printing secrets: **encoded
-> forms (base64, URL-encoded) are not matched**, and a secret the plugin transforms before
-> printing will pass through.
-
-The log tail is truncated to the **last 64 KB** (`LOG_TAIL_MAX_BYTES`).
-
-## What the runner does not have
-
-- **No `/metrics` endpoint.** No Prometheus instrumentation.
-- **No persisted credential.** Auth is the single `PLUGIN_RUNNER_SHARED_SECRET`, held in the
-  environment on both the runner and the API. Runner→API calls send it as
-  `Authorization: Bearer`; API→runner pushes are HMAC-signed with the same secret. Nothing is
-  cached to disk — see [enrollment.md](enrollment.md).
-- **No runner-side rotation flow.** To rotate, change `PLUGIN_RUNNER_SHARED_SECRET` on the API
-  and every runner to the new value and restart both sides together.
+> This is a backstop, not a licence. Plugins should still never print secrets: a secret the
+> plugin transforms before printing can pass through.
 
 ## Reporting a vulnerability
 

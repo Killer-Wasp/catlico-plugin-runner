@@ -22,16 +22,16 @@ python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
 `PLUGIN_RUNNER_ADVERTISED_URL` is the URL the **Catlico API** uses to reach this runner for
-event and install pushes. The runner self-reports it at registration, so it must be resolvable
+event (and rescan) pushes. The runner self-reports it at registration, so it must be resolvable
 *from the API host*, not just locally.
 
 ## Self-registration
 
-On startup the runner constructs its API client directly from the shared secret and runner id,
-then calls `register()` **once** to announce itself — reporting its `advertised_url` and its
-installed plugin manifests. There is no token to spend, no credential to cache, and no
-re-enrollment recovery: if the shared secret is wrong, every call is simply rejected. (The
-container-runtime preflight still runs *before* registration.)
+On startup the runner runs a `uv` preflight and provisions plugin venvs, then constructs its API
+client directly from the shared secret and runner id and calls `register()` **once** to announce
+itself — reporting its `advertised_url`, a constant `isolation_mode = "subprocess"`, and its
+plugin manifests. There is no token to spend, no credential to cache, and no re-enrollment
+recovery: if the shared secret is wrong, every call is simply rejected.
 
 Every runner→API request carries:
 
@@ -42,8 +42,9 @@ X-Runner-Id: <runner_id>
 
 ## Event-push authentication
 
-Inbound event and install pushes from the API to the runner (`/internal/events`) are signed
-with the same shared secret. The API signs the **raw request body**:
+Inbound event (and rescan) pushes from the API to the runner (`/internal/events`,
+`/internal/plugins/rescan`) are signed with the same shared secret. The API signs the **raw
+request body**:
 
 ```
 x-catlico-signature: sha256=<hex hmac-sha256(shared_secret, raw_body)>
