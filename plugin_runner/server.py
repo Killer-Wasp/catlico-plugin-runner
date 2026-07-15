@@ -1,9 +1,9 @@
 """Runner-private HTTP server.
 
 Catlico calls these ``/internal/*`` endpoints on the runner host. They are not
-public web endpoints. Event pushes are authenticated by an HMAC signature over the
-raw request body, keyed by the shared secret configured on both the API and the
-runner.
+public web endpoints. Event (and rescan) pushes are authenticated by an HMAC
+signature over the raw request body, keyed by the shared secret configured on
+both the API and the runner.
 """
 from __future__ import annotations
 
@@ -12,8 +12,6 @@ import hashlib
 import hmac
 import json
 import logging
-import tempfile
-from pathlib import Path
 from typing import Awaitable, Callable
 
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -24,11 +22,9 @@ from starlette.routing import Route
 
 from plugin_runner.client import PluginRunnerClient
 from plugin_runner.engine import dispatch_event
-from plugin_runner.installer import STATE_FAILED, STATE_INSTALLED, install_from_source
+from plugin_runner.executor import PluginExecutor, SubprocessExecutor
 from plugin_runner.metrics import REGISTRY as METRICS_REGISTRY
-from plugin_runner.metrics import set_installed_plugin_count
 from plugin_runner.registry import Registry
-from plugin_runner.sandbox import SandboxRunner, SubprocessSandboxRunner
 
 logger = logging.getLogger(__name__)
 
@@ -52,35 +48,25 @@ def create_app(
     registry: Registry,
     runner_id: str,
     api_base_url: str,
-    sandbox: SandboxRunner | None = None,
+    executor: PluginExecutor | None = None,
     push_secret: Callable[[], str] | None = None,
-    installer: Callable[..., Awaitable] = install_from_source,
-    sdk_source: str = "",
-    build_runtime: str = "docker",
-    install_root: Path | None = None,
+    rescan: Callable[[], Awaitable[None]] | None = None,
     spawn: Callable[[Awaitable], object] | None = None,
 ) -> Starlette:
-    """Build the runner's private app. ``push_secret`` is a callable resolving to
-    the shared secret used to verify inbound event/install push signatures
-    (``main.serve`` passes ``lambda: settings.shared_secret``).
+    """Build the runner's private app.
 
-    ``installer``/``spawn`` are injectable so the background install can be driven
-    and observed in tests: ``installer`` defaults to ``install_from_source`` and
-    ``spawn`` to a task-retaining ``create_task`` wrapper (fire-and-forget), but a
-    test can pass a fake installer plus a ``spawn`` that captures the coroutine to
-    await it.
-    ``sdk_source``/``build_runtime`` feed the installer's build step;
-    ``install_root`` is the parent dir clones land under (keyed by plugin_id)."""
-    sandbox = sandbox or SubprocessSandboxRunner()
+    ``push_secret`` resolves the shared secret used to verify inbound event/rescan
+    push signatures (``main.serve`` passes ``lambda: settings.shared_secret``).
+    ``rescan`` is the discover→sync→``replace_all`` provisioning coroutine invoked
+    by ``POST /internal/plugins/rescan`` — implemented here but deliberately
+    unwired from the API/web in this pass. ``spawn`` is injectable so a test can
+    capture and await the background rescan task.
+    """
+    executor = executor or SubprocessExecutor()
     push_secret = push_secret or (lambda: getattr(client, "push_signing_secret", ""))
-    install_root = install_root or (Path(tempfile.gettempdir()) / "catlico-plugin-installs")
 
-    # Retain a strong reference to every background install task for its whole
-    # lifetime. ``asyncio`` keeps only a WEAK reference to a bare ``create_task``
-    # result, so a fire-and-forget task can be garbage-collected — and thus
-    # silently cancelled — mid clone/build before it ever reports a result. This
-    # set is closed over by the app's handlers (held by the returned Starlette
-    # app), so it lives as long as the app rather than being a GC-able local.
+    # Retain a strong reference to every background task for its whole lifetime;
+    # asyncio keeps only a weak ref to a bare create_task result.
     _pending: set = set()
 
     def _default_spawn(coro: Awaitable) -> object:
@@ -97,7 +83,7 @@ def create_app(
                 "status": "healthy",
                 "runner_id": runner_id,
                 "installed_plugin_count": len(registry.all()),
-                "isolation_mode": getattr(sandbox, "isolation_mode", "subprocess"),
+                "isolation_mode": getattr(executor, "isolation_mode", "subprocess"),
             }
         )
 
@@ -105,7 +91,13 @@ def create_app(
         return JSONResponse(
             {
                 "plugins": [
-                    {"id": p.id, "version": p.version, "manifest": p.manifest}
+                    {
+                        "id": p.id,
+                        "version": p.version,
+                        "status": p.status,
+                        "error": p.error,
+                        "manifest": p.manifest,
+                    }
                     for p in registry.all()
                 ]
             }
@@ -120,120 +112,40 @@ def create_app(
         except json.JSONDecodeError:
             return JSONResponse({"detail": "invalid JSON"}, status_code=400)
         summary = await dispatch_event(
-            envelope, client, registry, sandbox,
+            envelope, client, registry, executor,
             runner_id=runner_id, api_base_url=api_base_url,
         )
         return JSONResponse(summary)
 
-    async def _report_failed(plugin_version_id: str, error: str) -> None:
-        try:
-            await client.report_install_status(plugin_version_id, STATE_FAILED, error=error)
-        except Exception:  # noqa: BLE001 — reporting failure must not itself crash the task
-            logger.exception("failed to report install failure for %s", plugin_version_id)
+    async def rescan_endpoint(request: Request) -> JSONResponse:
+        """Re-discover + re-sync plugins and atomically swap the live registry.
 
-    async def _run_install(
-        plugin_version_id: str, plugin_id: str, source_url: str, source_ref: str
-    ) -> None:
-        """Background install driver. Clones + builds under
-        ``install_root/<plugin_id>`` and streams progress back to the API sink.
-
-        On a successful install the freshly built plugin is folded into the live
-        in-memory ``registry`` (see below), so this running process starts
-        dispatching to it immediately — no runner restart or re-discovery needed.
-        A failed install leaves the registry untouched."""
-        target_dir = install_root / plugin_id
-
-        async def on_state(state: str) -> None:
-            # Intermediate progress only. Terminal states are reported below from
-            # the InstallResult so they carry commit_sha/image_digest/log/error.
-            if state in (STATE_INSTALLED, STATE_FAILED):
-                return
-            await client.report_install_status(plugin_version_id, state)
-
-        try:
-            result = await installer(
-                source_url,
-                source_ref,
-                target_dir,
-                on_state=on_state,
-                sdk_source=sdk_source,
-                runtime=build_runtime,
-            )
-        except Exception as exc:  # noqa: BLE001 — a background task must never die silently
-            logger.exception("install of %s raised", plugin_version_id)
-            await _report_failed(plugin_version_id, str(exc))
-            return
-
-        # Serve the new plugin without a restart: on success the pipeline hands
-        # back a loaded ``InstalledPlugin`` (the container image is already built,
-        # the cloned source is on disk for the subprocess adapter), so folding it
-        # into the registry makes ``dispatch_event`` and ``for_trigger`` see it on
-        # the very next event. ``registry.add`` overwrites by id, so a re-install
-        # / version bump replaces the prior entry rather than duplicating it.
-        # This is a plain dict write with no ``await`` before the read side in
-        # ``dispatch_event``, so a concurrent event sees the old-or-new registry
-        # atomically — never a half-updated one. A failed install (or a caller
-        # that returns no ``plugin``) leaves the registry as-is.
-        if result.status == STATE_INSTALLED and result.plugin is not None:
-            registry.add(result.plugin)
-            set_installed_plugin_count(len(registry.all()))
-            logger.info(
-                "registered plugin %s@%s from install — serving without restart",
-                result.plugin.id,
-                result.plugin.version,
-            )
-
-        try:
-            await client.report_install_status(
-                plugin_version_id,
-                result.status,
-                commit_sha=result.commit_sha or None,
-                # InstallResult only carries the image *tag* (no registry-pushed
-                # digest); it is the closest stable image identifier we have.
-                image_digest=result.image_tag or None,
-                install_log=result.log or None,
-                error="; ".join(result.errors) if result.errors else None,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "failed to report terminal install status for %s", plugin_version_id
-            )
-
-    async def install(request: Request) -> JSONResponse:
+        Implemented and functional, but intentionally unwired: no API proxy route
+        or web button calls it in this pass (rescan is restart-only for operators).
+        Runs in the background (no GC — an in-flight run may still use an old venv)
+        and returns 202 immediately."""
         raw = await request.body()
         if not _verify(raw, request.headers.get(SIGNATURE_HEADER), push_secret()):
             return JSONResponse({"detail": "invalid signature"}, status_code=401)
-        try:
-            payload = json.loads(raw or b"{}")
-            plugin_version_id = payload["plugin_version_id"]
-            plugin_id = payload["plugin_id"]
-            source_url = payload["source_url"]
-            source_ref = payload["source_ref"]
-        except (json.JSONDecodeError, KeyError, TypeError):
-            return JSONResponse({"detail": "invalid payload"}, status_code=400)
-        # Kick the clone+build off in the background so the HTTP response returns
-        # immediately (the API maps a slow/blocking response to a 502).
-        spawn(_run_install(plugin_version_id, plugin_id, source_url, source_ref))
-        return JSONResponse(
-            {"accepted": True, "plugin_version_id": plugin_version_id}, status_code=202
-        )
+        if rescan is None:
+            return JSONResponse({"detail": "rescan not configured"}, status_code=501)
+
+        async def _run_rescan() -> None:
+            try:
+                await rescan()
+            except Exception:  # noqa: BLE001 — a background task must never die silently
+                logger.exception("rescan failed")
+
+        spawn(_run_rescan())
+        return JSONResponse({"accepted": True}, status_code=202)
 
     async def cancel_run(request: Request) -> JSONResponse:
-        # Best-effort: inline dispatch completes within the event request, so
-        # there is usually no in-flight run to kill here. Wired for the
-        # background-dispatch path.
         run_id = request.path_params["run_id"]
         return JSONResponse({"run_id": run_id, "cancelled": True})
 
     async def metrics(request: Request) -> Response:
-        # Deliberately unauthenticated, at the Prometheus-conventional
-        # top-level path (not under /internal like the other routes here).
-        # This server binds to settings.host, which defaults to 0.0.0.0 (not
-        # restricted to an internal-only interface), so exposing /metrics
-        # without auth is a conscious choice, matching how Prometheus
-        # exporters are normally deployed (scraped over a private network,
-        # not gated per-endpoint) rather than a gap that mirrors the other
-        # (signed/internal) routes.
+        # Deliberately unauthenticated, at the Prometheus-conventional top-level
+        # path (not under /internal), matching how exporters are normally scraped.
         return Response(
             generate_latest(METRICS_REGISTRY), media_type=CONTENT_TYPE_LATEST
         )
@@ -243,7 +155,7 @@ def create_app(
             Route("/internal/health", health, methods=["GET"]),
             Route("/internal/plugins", plugins, methods=["GET"]),
             Route("/internal/events", events, methods=["POST"]),
-            Route("/internal/plugins/install", install, methods=["POST"]),
+            Route("/internal/plugins/rescan", rescan_endpoint, methods=["POST"]),
             Route("/internal/runs/{run_id}/cancel", cancel_run, methods=["POST"]),
             Route("/metrics", metrics, methods=["GET"]),
         ]

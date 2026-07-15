@@ -26,7 +26,7 @@ class TestPluginRunnerClient:
         assert client._url("/heartbeat") == "http://catlico:8000/api/api/internal/plugin-runner/heartbeat"
 
 
-async def test_report_install_status_posts_encoded_url_and_body():
+async def test_submit_result_posts_body_with_auth():
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -41,26 +41,11 @@ async def test_report_install_status_posts_encoded_url_and_body():
         runner_id="runner-1",
         transport=httpx.MockTransport(handler),
     )
-    # id contains both '@' and '/', which must be percent-encoded as one segment.
-    await client.report_install_status(
-        "acme/net@1.2.0",
-        "building",
-        commit_sha="deadbeef",
-        image_digest="catlico-plugin/acme:1.2.0",
-        install_log="log-tail",
-    )
+    await client.submit_result("run-1", {"status": "success", "log_tail": "ok"})
 
     assert captured["auth"] == "Bearer cred"
-    assert captured["raw_path"] == (
-        b"/api/internal/plugin-runner/plugins/acme%2Fnet%401.2.0/install-status"
-    )
-    assert captured["body"] == {
-        "state": "building",
-        "commit_sha": "deadbeef",
-        "image_digest": "catlico-plugin/acme:1.2.0",
-        "install_log": "log-tail",
-        "error": None,
-    }
+    assert captured["raw_path"] == b"/api/internal/plugin-runner/runs/run-1/result"
+    assert captured["body"]["status"] == "success"
 
 
 async def test_claim_run_outcomes():

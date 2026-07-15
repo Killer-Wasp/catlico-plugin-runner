@@ -1,12 +1,12 @@
-"""Unit tests for secret redaction in the sandbox log tail.
+"""Unit tests for secret redaction in the executor log tail.
 
 These exercise the pure helpers (``_redact`` / ``_log_tail``) directly so the
-redaction contract is pinned independent of any adapter or subprocess.
+redaction contract is pinned independent of any subprocess.
 """
 import base64
 import urllib.parse
 
-from plugin_runner.sandbox import (
+from plugin_runner.executor import (
     LOG_TAIL_MAX_BYTES,
     REDACTION_MARKER,
     _log_tail,

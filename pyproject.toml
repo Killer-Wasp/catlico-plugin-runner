@@ -25,7 +25,10 @@ build-backend = "hatchling.build"
 packages = ["plugin_runner"]
 
 [tool.uv.sources]
-catlico-plugin-sdk = { path = "../catlico-plugin-sdk" }
+# Editable so the runner always resolves the live sibling SDK checkout (dev + tests
+# exercise the SDK-under-development, not a stale copied wheel). Production images
+# resolve the SDK from the plugin lockfiles (git pin / index), not this source.
+catlico-plugin-sdk = { path = "../catlico-plugin-sdk", editable = true }
 
 [dependency-groups]
 dev = [
@@ -36,3 +39,6 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["."]
+markers = [
+    "slow: exercises real uv/venv operations (may hit the network); deselect with -m 'not slow'",
+]
