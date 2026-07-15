@@ -1,7 +1,39 @@
 """Runner configuration."""
 from __future__ import annotations
 
+import os
+import tempfile
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: Constant reported to the API on the runner row. Execution is always a plain
+#: subprocess bound to the plugin's venv — there is no sandbox and no other mode
+#: (trusted first-party code, decision 2). Kept as a constant so the API's
+#: ``isolation_mode`` column keeps a value without a corresponding setting.
+ISOLATION_MODE = "subprocess"
+
+
+def default_cache_root() -> Path:
+    """Where venvs, the uv cache, and runner state live by default.
+
+    ``/var/cache/catlico`` in a container/host that grants it (writable), else
+    ``~/.cache/catlico`` — zero-config on a macOS dev box. Local disk only:
+    venvs must never live on EFS/NFS (decision 3).
+    """
+    system = Path("/var/cache/catlico")
+    try:
+        system.mkdir(parents=True, exist_ok=True)
+        if os.access(system, os.W_OK):
+            return system
+    except OSError:
+        pass
+    home = Path.home() / ".cache" / "catlico"
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        return home
+    except OSError:
+        return Path(tempfile.gettempdir()) / "catlico-cache"
 
 
 class RunnerSettings(BaseSettings):
@@ -18,68 +50,48 @@ class RunnerSettings(BaseSettings):
     #: Shared secret configured identically on the Catlico API and this runner.
     #: It is the whole trust boundary: every internal call sends it as
     #: ``Authorization: Bearer <secret>`` (plus ``X-Runner-Id``), and inbound
-    #: event/install pushes are HMAC-verified against it.
+    #: event/rescan pushes are HMAC-verified against it.
     shared_secret: str = ""
 
-    #: The URL the Catlico API uses to reach this runner for event/install
-    #: pushes. Self-reported at registration (there is no admin pre-provisioning
-    #: step any more). Empty leaves the API unable to push to this runner.
+    #: The URL the Catlico API uses to reach this runner for event pushes.
+    #: Self-reported at registration. Empty leaves the API unable to push.
     advertised_url: str = ""
 
-    #: Base URL the *plugin sandbox* uses to reach the Catlico runtime API. Empty
-    #: (default) reuses ``catlico_api_url``. Override it when a plugin container
-    #: cannot resolve the runner's own URL — e.g. local container-isolation dev on
-    #: Docker Desktop, where the API runs on the host and the runner uses
-    #: ``localhost`` but a bridged plugin container must use
-    #: ``http://host.docker.internal:8000`` (the ``host.docker.internal`` hostname
-    #: is made resolvable via ``--add-host`` in the container adapter).
+    #: Base URL the *plugin* uses to reach the Catlico runtime API. Empty
+    #: (default) reuses ``catlico_api_url``. Override when the plugin subprocess
+    #: cannot resolve the runner's own URL.
     plugin_api_url: str = ""
 
-    #: Directories scanned for locally-provisioned plugins (Docker volume mounts).
-    plugin_dirs: list[str] = []
+    #: Root directory of provisioned plugins — each subdirectory holding a
+    #: ``catlico-plugin.toml`` is one plugin (a full uv project). Underscore-
+    #: prefixed dirs are skipped (reserved, e.g. ``_wheelhouse``). Pre-provision
+    #: it via a baked image, a Docker volume/EFS mount, or ``plugin-runner install``.
+    plugins_dir: str = "/plugins"
 
-    #: Local checkout of ``catlico-plugin-sdk`` to bake into each plugin image.
-    #: Needed for local dev, where the SDK is an unpublished sibling checkout that
-    #: lives *outside* a plugin's Docker build context — the install pipeline
-    #: stages it into the context so the image can ``pip install`` it. Empty
-    #: (default) installs the published ``catlico-plugin-sdk`` from PyPI, which is
-    #: the production path.
+    #: Where per-plugin dependency venvs are materialised (local disk, never EFS),
+    #: keyed by ``sha256(uv.lock)``. Empty -> ``default_cache_root()/venvs``.
+    venvs_dir: str = ""
+
+    #: uv's package cache (shared across plugin syncs). Empty ->
+    #: ``default_cache_root()/uv``. A persistent volume here makes cold syncs fast
+    #: and enables offline (``UV_OFFLINE=1``) operation.
+    uv_cache_dir: str = ""
+
+    #: Dev-only editable SDK override. When set, every venv gets the SDK installed
+    #: editable from this checkout after ``uv sync`` (the marker records it, so
+    #: flipping it rebuilds the venv). Empty -> the SDK resolves from the plugin's
+    #: own lockfile (git pin / index).
     sdk_source: str = ""
 
-    #: Execution isolation mode (adapter selected by ``main.select_sandbox``).
-    #: ``container`` (the default) runs each untrusted third-party plugin in a
-    #: throwaway, hardened container — this is the safe default. ``subprocess``
-    #: is an explicit opt-in for trusted local development only: it runs plugins
-    #: as child processes on the host with no container, no read-only rootfs, no
-    #: resource caps and no capability drops — no isolation. Any other value is
-    #: rejected at startup (see ``select_sandbox``).
-    isolation_mode: str = "container"
+    #: Wall-clock cap for a single plugin ``uv sync``.
+    uv_sync_timeout_seconds: int = 600
 
-    #: Container runtime binary invoked by the container adapter (argv[0] of
-    #: every ``run``/``kill`` command it shells out to). ``docker`` (the
-    #: default) or ``podman`` are the expected values; any binary on PATH that
-    #: understands docker-compatible ``run``/``kill`` flags works. Ignored by
-    #: the subprocess adapter.
-    container_runtime: str = "docker"
+    #: How many plugin venvs may sync concurrently at startup.
+    venv_sync_concurrency: int = 4
 
-    #: Value passed to the container adapter's ``--network`` flag, e.g.
-    #: ``bridge`` (the default; the plugin can reach the Catlico API),
-    #: ``none`` (fully isolates a plugin with no outbound needs), or a named
-    #: Docker/Podman network. Ignored by the subprocess adapter.
-    container_network: str = "bridge"
-
-    #: Extra ``--add-host`` entries for plugin containers (``"name:ip"`` each).
-    #: Empty by default: Docker Desktop already resolves ``host.docker.internal``
-    #: to the host. On native Linux, set
-    #: ``["host.docker.internal:host-gateway"]`` so a plugin can reach a Catlico
-    #: API on the runner host (see ``plugin_api_url``). Ignored by the subprocess
-    #: adapter.
-    container_extra_hosts: list[str] = []
-
-    #: Parent directory GitHub/source installs are cloned + built under (keyed by
-    #: plugin_id) when the API triggers ``POST /internal/plugins/install``. Empty
-    #: (default) uses a subdir of the system temp dir.
-    install_root: str = ""
+    #: Where the runner persists its local state. Under ``default_cache_root()`` so
+    #: an immutable image keeps working; override with PLUGIN_RUNNER_STATE_FILE.
+    state_file: str = ""
 
     #: Private HTTP server bind.
     host: str = "0.0.0.0"
@@ -87,6 +99,15 @@ class RunnerSettings(BaseSettings):
 
     heartbeat_interval_seconds: int = 30
     http_timeout: float = 30.0
+
+    def resolved_venvs_dir(self) -> Path:
+        return Path(self.venvs_dir) if self.venvs_dir else default_cache_root() / "venvs"
+
+    def resolved_uv_cache_dir(self) -> Path:
+        return Path(self.uv_cache_dir) if self.uv_cache_dir else default_cache_root() / "uv"
+
+    def resolved_state_file(self) -> Path:
+        return Path(self.state_file) if self.state_file else default_cache_root() / "state.json"
 
 
 def load_settings() -> RunnerSettings:

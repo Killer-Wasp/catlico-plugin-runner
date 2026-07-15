@@ -1,7 +1,7 @@
-"""Event dispatch engine: claim → sandbox → report, and loop suppression."""
+"""Event dispatch engine: claim → execute → report, loop suppression, quarantine."""
 from plugin_runner.engine import dispatch_event
-from plugin_runner.registry import InstalledPlugin, Registry
-from plugin_runner.sandbox import SandboxRunResult
+from plugin_runner.executor import RunResult
+from plugin_runner.registry import STATUS_FAILED, InstalledPlugin, Registry
 
 
 class FakeClient:
@@ -35,7 +35,7 @@ class FakeClient:
         self.submitted = body
 
 
-class FakeSandbox:
+class FakeExecutor:
     def __init__(self, result):
         self._result = result
         self.requests = []
@@ -45,12 +45,15 @@ class FakeSandbox:
         return self._result
 
 
-def _plugin() -> InstalledPlugin:
-    return InstalledPlugin(
+def _plugin(**overrides) -> InstalledPlugin:
+    base = dict(
         id="acme", version="1.0.0",
         manifest={"triggers": ["observable.created"], "permissions": ["read:observable"], "timeout_seconds": 30},
-        module="acme.plugin", cls="Plugin", path="/plugins/acme/src",
+        module="main", app_object="catlico", path="/plugins/acme",
+        venv_python="/venvs/acme-abc/bin/python",
     )
+    base.update(overrides)
+    return InstalledPlugin(**base)
 
 
 def _registry() -> Registry:
@@ -69,73 +72,107 @@ _ENVELOPE = {
 
 async def test_successful_dispatch_runs_full_lifecycle():
     client = FakeClient("created")
-    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success", log_tail="ok"))
+    executor = FakeExecutor(RunResult(run_id="r1", status="success", log_tail="ok"))
     summary = await dispatch_event(
-        _ENVELOPE, client, _registry(), sandbox,
+        _ENVELOPE, client, _registry(), executor,
         runner_id="runner-1", api_base_url="http://catlico:8000",
     )
     assert summary["outcomes"]["acme"] == "success"
     assert client.calls == ["claim", "accept", "config", "start", "result:success"]
-    # Sandbox received config, secrets, token, and plugin coordinates.
-    req = sandbox.requests[0]
+    req = executor.requests[0]
     assert req.run_token == "tok"
     assert req.secrets == {"api_key": "k"}
-    assert req.plugin_module == "acme.plugin"
+    assert req.plugin_module == "main"
+    assert req.plugin_object == "catlico"
+    assert req.python_executable == "/venvs/acme-abc/bin/python"
+    assert req.declared_triggers == ["observable.created"]
     assert client.submitted["log_tail"] == "ok"
 
 
 async def test_skip_reports_skip_not_result():
     client = FakeClient("created")
-    sandbox = FakeSandbox(
-        SandboxRunResult(run_id="r1", status="skipped", skip_reason="should_process")
+    executor = FakeExecutor(
+        RunResult(run_id="r1", status="skipped", skip_reason="no matcher accepted")
     )
     await dispatch_event(
-        _ENVELOPE, client, _registry(), sandbox,
+        _ENVELOPE, client, _registry(), executor,
         runner_id="runner-1", api_base_url="http://c",
     )
-    assert "skip:should_process" in client.calls
+    assert "skip:no matcher accepted" in client.calls
     assert not any(c.startswith("result:") for c in client.calls)
 
 
 async def test_duplicate_claim_stops_before_execution():
     client = FakeClient("duplicate")
-    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
+    executor = FakeExecutor(RunResult(run_id="r1", status="success"))
     summary = await dispatch_event(
-        _ENVELOPE, client, _registry(), sandbox,
+        _ENVELOPE, client, _registry(), executor,
         runner_id="runner-1", api_base_url="http://c",
     )
     assert summary["outcomes"]["acme"] == "duplicate"
     assert client.calls == ["claim"]
-    assert sandbox.requests == []
+    assert executor.requests == []
 
 
 async def test_plugin_actor_event_is_suppressed():
     client = FakeClient("created")
-    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
+    executor = FakeExecutor(RunResult(run_id="r1", status="success"))
     summary = await dispatch_event(
-        {**_ENVELOPE, "actor": "plugin:acme@1.0.0"}, client, _registry(), sandbox,
+        {**_ENVELOPE, "actor": "plugin:acme@1.0.0"}, client, _registry(), executor,
         runner_id="runner-1", api_base_url="http://c",
     )
     assert summary["suppressed"] is True
     assert client.calls == []
 
 
+# --- Quarantine ---
+
+
+async def test_quarantined_plugin_is_clean_noop_never_claims():
+    client = FakeClient("created")
+    executor = FakeExecutor(RunResult(run_id="r1", status="success"))
+    registry = Registry()
+    registry.add(_plugin(status=STATUS_FAILED, error="venv sync failed"))
+    summary = await dispatch_event(
+        _ENVELOPE, client, registry, executor,
+        runner_id="runner-1", api_base_url="http://c",
+    )
+    # for_trigger already filters quarantined, so this event never selects it.
+    assert summary["outcomes"] == {}
+    assert client.calls == []
+
+
+async def test_targeted_quarantined_plugin_reports_quarantined():
+    """A manual (targeted) run selects the plugin by id, bypassing for_trigger —
+    so the engine itself must refuse a non-ready plugin and never claim."""
+    client = FakeClient("created")
+    executor = FakeExecutor(RunResult(run_id="r1", status="success"))
+    registry = Registry()
+    registry.add(_plugin(status=STATUS_FAILED, error="bad manifest"))
+    envelope = {**_ENVELOPE, "target_plugin_id": "acme"}
+    summary = await dispatch_event(
+        envelope, client, registry, executor,
+        runner_id="runner-1", api_base_url="http://c",
+    )
+    assert summary["outcomes"] == {"acme": "quarantined"}
+    assert client.calls == []
+    assert executor.requests == []
+
+
 # --- Targeted (manual) dispatch ---
 
 
 def _second_plugin() -> InstalledPlugin:
-    return InstalledPlugin(
-        id="other", version="1.0.0",
+    return _plugin(
+        id="other",
         manifest={"triggers": ["case.created"], "permissions": [], "timeout_seconds": 30},
-        module="other.plugin", cls="Plugin", path="/plugins/other/src",
+        module="main", app_object="catlico", path="/plugins/other",
     )
 
 
 async def test_target_plugin_id_runs_only_that_plugin_bypassing_triggers():
-    """A manual run targets one plugin and runs it even when the plugin's
-    declared triggers do not cover the event type."""
     client = FakeClient("created")
-    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
+    executor = FakeExecutor(RunResult(run_id="r1", status="success"))
     registry = _registry()
     registry.add(_second_plugin())
     envelope = {
@@ -144,7 +181,7 @@ async def test_target_plugin_id_runs_only_that_plugin_bypassing_triggers():
         "target_plugin_id": "acme",
     }
     summary = await dispatch_event(
-        envelope, client, registry, sandbox,
+        envelope, client, registry, executor,
         runner_id="runner-1", api_base_url="http://c",
     )
     assert summary["outcomes"] == {"acme": "success"}
@@ -153,37 +190,24 @@ async def test_target_plugin_id_runs_only_that_plugin_bypassing_triggers():
 
 async def test_unknown_target_plugin_is_clean_noop():
     client = FakeClient("created")
-    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
+    executor = FakeExecutor(RunResult(run_id="r1", status="success"))
     envelope = {**_ENVELOPE, "target_plugin_id": "does-not-exist"}
     summary = await dispatch_event(
-        envelope, client, _registry(), sandbox,
+        envelope, client, _registry(), executor,
         runner_id="runner-1", api_base_url="http://c",
     )
     assert summary == {"dispatched": 0, "suppressed": False, "outcomes": {}}
     assert client.calls == []
-    assert sandbox.requests == []
+    assert executor.requests == []
 
 
 async def test_absent_target_keeps_trigger_fanout():
-    """No target -> unchanged behaviour: only trigger matches run, not everything."""
     client = FakeClient("created")
-    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
+    executor = FakeExecutor(RunResult(run_id="r1", status="success"))
     registry = _registry()
     registry.add(_second_plugin())  # triggers on case.created, must NOT run
     summary = await dispatch_event(
-        _ENVELOPE, client, registry, sandbox,
+        _ENVELOPE, client, registry, executor,
         runner_id="runner-1", api_base_url="http://c",
     )
     assert set(summary["outcomes"]) == {"acme"}
-
-
-async def test_targeted_envelope_still_suppresses_plugin_actor():
-    client = FakeClient("created")
-    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
-    envelope = {**_ENVELOPE, "target_plugin_id": "acme", "actor": "plugin:acme@1.0.0"}
-    summary = await dispatch_event(
-        envelope, client, _registry(), sandbox,
-        runner_id="runner-1", api_base_url="http://c",
-    )
-    assert summary["suppressed"] is True
-    assert client.calls == []

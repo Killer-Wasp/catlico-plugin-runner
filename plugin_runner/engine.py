@@ -1,9 +1,9 @@
 """Event dispatch: turn one Catlico event into plugin runs.
 
-For each installed plugin that declares the event's trigger, the runner claims a
-run from Catlico (the API arbitrates duplicates/concurrency/skips), then executes
-the plugin in a sandbox and reports the outcome back. The runner never touches the
-database; all state changes go through the internal API.
+For each ready plugin that declares the event's trigger, the runner claims a run
+from Catlico (the API arbitrates duplicates/concurrency/skips), then executes the
+plugin in a subprocess bound to its venv and reports the outcome back. The runner
+never touches the database; all state changes go through the internal API.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import logging
 import time
 
 from plugin_runner.client import PluginRunnerClient
+from plugin_runner.executor import PluginExecutor, RunRequest
 from plugin_runner.metrics import (
     observe_sandbox_duration,
     record_claim_outcome,
@@ -19,8 +20,7 @@ from plugin_runner.metrics import (
     record_suppressed_event,
     record_terminal_status,
 )
-from plugin_runner.registry import InstalledPlugin, Registry
-from plugin_runner.sandbox import SandboxRunner, SandboxRunRequest
+from plugin_runner.registry import STATUS_READY, InstalledPlugin, Registry
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +42,23 @@ async def _run_one(
     plugin: InstalledPlugin,
     envelope: dict,
     client: PluginRunnerClient,
-    sandbox: SandboxRunner,
+    executor: PluginExecutor,
     *,
     runner_id: str,
     api_base_url: str,
 ) -> str:
-    """Claim, execute, and report a single plugin run. Returns its outcome."""
+    """Claim, execute, and report a single plugin run. Returns its outcome.
+
+    A targeted (manual) run of a plugin that isn't ``ready`` (bad manifest, failed
+    venv sync) is a clean "quarantined" no-op — the runner never spawns a broken
+    plugin, and never claims a run it can't perform."""
+    if plugin.status != STATUS_READY:
+        logger.warning(
+            "skipping quarantined plugin %s (status=%s): %s",
+            plugin.id, plugin.status, plugin.error,
+        )
+        return "quarantined"
+
     claim = await client.claim_run(_claim_body(plugin, envelope, runner_id))
     outcome = claim["outcome"]
     record_claim_outcome(outcome)
@@ -61,23 +72,25 @@ async def _run_one(
     config = await client.get_run_config(run_id)
     await client.start_run(run_id)
 
-    request = SandboxRunRequest(
+    request = RunRequest(
         run_id=run_id,
         plugin_module=plugin.module,
-        plugin_class=plugin.cls,
+        plugin_object=plugin.app_object,
         event=envelope,
         config=config.get("settings", {}),
         secrets=config.get("secrets", {}),
         plugin_id=plugin.id,
         plugin_version=plugin.version,
         permissions=plugin.permissions,
+        declared_triggers=plugin.triggers,
         plugin_path=plugin.path,
+        python_executable=plugin.venv_python,
         timeout_seconds=plugin.timeout_seconds,
         api_base_url=api_base_url,
         run_token=token,
     )
     start = time.monotonic()
-    result = await sandbox.run(request)
+    result = await executor.run(request)
     observe_sandbox_duration(time.monotonic() - start)
 
     record_terminal_status(result.status)
@@ -106,7 +119,7 @@ async def dispatch_event(
     envelope: dict,
     client: PluginRunnerClient,
     registry: Registry,
-    sandbox: SandboxRunner,
+    executor: PluginExecutor,
     *,
     runner_id: str,
     api_base_url: str,
@@ -127,9 +140,7 @@ async def dispatch_event(
 
     target_plugin_id = envelope.get("target_plugin_id")
     if target_plugin_id:
-        targeted = next(
-            (p for p in registry.all() if p.id == target_plugin_id), None
-        )
+        targeted = registry.get(target_plugin_id)
         plugins = [targeted] if targeted is not None else []
     else:
         event_type = envelope.get("event_type", "")
@@ -139,7 +150,7 @@ async def dispatch_event(
     for plugin in plugins:
         try:
             outcomes[plugin.id] = await _run_one(
-                plugin, envelope, client, sandbox,
+                plugin, envelope, client, executor,
                 runner_id=runner_id, api_base_url=api_base_url,
             )
         except Exception as exc:  # noqa: BLE001 — one plugin must not sink the event

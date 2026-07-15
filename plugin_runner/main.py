@@ -1,70 +1,54 @@
-"""Runner entrypoint: self-register, start the heartbeat loop, serve the private API."""
+"""Runner entrypoint + build-time CLI.
+
+Console-script subcommands (default is ``serve``):
+
+* ``plugin-runner`` / ``plugin-runner serve`` — provision plugin venvs, self-register,
+  start the heartbeat loop, and serve the private API.
+* ``plugin-runner sync`` — discover + provision every plugin venv, exit non-zero on any
+  failure (fail-fast for image builds/CI).
+* ``plugin-runner install <source> [--ref REF] [--name NAME]`` — copy a local plugin dir or
+  clone a git repo into the plugins dir. Build-stage/dev tool only — no HTTP surface.
+"""
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
+import shutil
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import uvicorn
 
+from plugin_runner import venvs
 from plugin_runner.client import PluginRunnerClient
-from plugin_runner.installer import STATE_INSTALLED, ensure_images
+from plugin_runner.executor import SubprocessExecutor
+from plugin_runner.gitclone import GitCloneError, clone_source
 from plugin_runner.metrics import (
     record_heartbeat,
     set_installed_plugin_count,
     set_isolation_mode,
+    set_quarantined_plugin_count,
 )
-from plugin_runner.registry import discover
-from plugin_runner.sandbox import ContainerSandboxRunner, SandboxRunner, SubprocessSandboxRunner
+from plugin_runner.registry import STATUS_FAILED, STATUS_READY, Registry, discover
 from plugin_runner.server import create_app
-from plugin_runner.settings import RunnerSettings, load_settings
+from plugin_runner.settings import ISOLATION_MODE, RunnerSettings, load_settings
 
 logger = logging.getLogger(__name__)
 
-#: Isolation modes the runner knows how to select an adapter for.
-VALID_ISOLATION_MODES = ("container", "subprocess")
-
-#: Signature of the injectable container-runtime preflight: given the runtime
-#: name (e.g. ``"docker"``), return whether it is actually usable.
-RuntimeCheck = Callable[[str], Awaitable[bool]]
+#: Injectable uv preflight: is ``uv --version`` runnable and returning 0?
+UvCheck = Callable[[], Awaitable[bool]]
 
 
-class ContainerRuntimeUnavailable(RuntimeError):
-    """Raised at startup when container isolation is selected but the container
-    runtime is not usable. Refusing to start is deliberate: see
-    ``_verify_container_runtime``."""
+class UvUnavailable(RuntimeError):
+    """Raised at startup when ``uv`` is not usable. Refusing to start is deliberate:
+    every plugin venv sync would fail, so the runner must not register as healthy."""
 
 
-def select_sandbox(settings: RunnerSettings) -> SandboxRunner:
-    """Container isolation is the default for untrusted plugins; the trusted
-    subprocess adapter is opt-in via ``isolation_mode = subprocess``.
-
-    An unrecognised ``isolation_mode`` is a hard error — we never silently fall
-    back to an adapter the operator did not ask for (a typo like ``contianer``
-    could otherwise quietly land plugins in either isolation posture)."""
-    if settings.isolation_mode == "subprocess":
-        return SubprocessSandboxRunner()
-    if settings.isolation_mode == "container":
-        return ContainerSandboxRunner(
-            runtime=settings.container_runtime,
-            network=settings.container_network,
-            extra_hosts=settings.container_extra_hosts,
-        )
-    raise ValueError(
-        f"invalid isolation_mode {settings.isolation_mode!r}; "
-        f"valid values are: {', '.join(VALID_ISOLATION_MODES)}"
-    )
-
-
-async def _container_runtime_available(runtime: str) -> bool:
-    """Default preflight: is ``<runtime> version`` runnable and returning 0?
-
-    Injected in tests (via ``serve(..., runtime_check=...)``) so the suite never
-    shells out to Docker."""
+async def _uv_available() -> bool:
     try:
         proc = await asyncio.create_subprocess_exec(
-            runtime, "version",
+            "uv", "--version",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -77,75 +61,74 @@ async def _container_runtime_available(runtime: str) -> bool:
         return False
 
 
-async def _verify_container_runtime(
-    sandbox: SandboxRunner, runtime_check: RuntimeCheck
-) -> None:
-    """Fail loudly and early if container isolation is selected but its runtime
-    is unusable.
-
-    We refuse to start rather than start degraded. A runner that starts without
-    a working runtime would still answer ``/internal/health`` as healthy, keep
-    heartbeating, and claim runs — then fail every single one late, per-run.
-    Silently accepting work it cannot perform is worse than not starting, so the
-    process exits and an operator sees the failure immediately.
-
-    No-op for the subprocess adapter, which never touches a container runtime."""
-    if not isinstance(sandbox, ContainerSandboxRunner):
-        return
-    runtime = getattr(sandbox, "_runtime", "docker")
-    if await runtime_check(runtime):
+async def _verify_uv(uv_check: UvCheck) -> None:
+    if await uv_check():
         return
     logger.error(
-        "container isolation is enabled but the container runtime %r is not "
-        "usable (a `%s version` preflight failed). Every plugin run would fail. "
-        "Refusing to start. Fix the runtime (is %r installed, on PATH, and its "
-        "daemon running?), or explicitly opt out by setting "
-        "PLUGIN_RUNNER_ISOLATION_MODE=subprocess — which DISABLES all isolation "
-        "(no container, read-only rootfs, resource caps or capability drops) and "
-        "is intended for trusted local development only.",
-        runtime, runtime, runtime,
+        "uv is not usable (a `uv --version` preflight failed). Every plugin venv "
+        "sync would fail. Refusing to start. Install uv and put it on PATH."
     )
-    raise ContainerRuntimeUnavailable(
-        f"container runtime {runtime!r} is not usable; refusing to start. "
-        f"Set PLUGIN_RUNNER_ISOLATION_MODE=subprocess (trusted local development "
-        f"only, disables isolation) to opt out."
+    raise UvUnavailable("uv is not usable; refusing to start")
+
+
+def _fold_venv_results(
+    registry: Registry, results: dict[str, venvs.VenvResult]
+) -> int:
+    """Attach venv pythons to plugins and quarantine sync failures. Returns the
+    quarantined count and updates the gauges."""
+    quarantined = 0
+    for plugin in registry.all():
+        result = results.get(plugin.id)
+        if result is not None:
+            plugin.venv_python = result.python
+            if not result.ok:
+                plugin.status = STATUS_FAILED
+                detail = result.error or "venv sync failed"
+                plugin.error = f"{plugin.error}; {detail}" if plugin.error else detail
+        if plugin.status != STATUS_READY:
+            quarantined += 1
+    set_installed_plugin_count(len(registry.all()))
+    set_quarantined_plugin_count(quarantined)
+    return quarantined
+
+
+async def _provision(settings: RunnerSettings, *, collect_garbage: bool) -> Registry:
+    """Discover plugins and ensure each has a synced venv, folding results.
+
+    ``collect_garbage`` prunes stale venv dirs — passed True at startup only,
+    never on rescan (an in-flight run may still be bound to an old venv)."""
+    registry = discover(settings.plugins_dir)
+    results = await venvs.ensure_all(
+        registry.all(),
+        venvs_dir=settings.resolved_venvs_dir(),
+        uv_cache_dir=settings.resolved_uv_cache_dir(),
+        sdk_source=settings.sdk_source,
+        timeout=settings.uv_sync_timeout_seconds,
+        concurrency=settings.venv_sync_concurrency,
+        collect_garbage=collect_garbage,
     )
+    quarantined = _fold_venv_results(registry, results)
+    logger.info(
+        "provisioned %d plugin(s), %d ready, %d quarantined",
+        len(registry.all()), len(registry.all()) - quarantined, quarantined,
+    )
+    return registry
 
 
-async def _ensure_plugin_images(
-    sandbox: SandboxRunner, registry, *, sdk_source: str = ""
-) -> None:
-    """Build any per-plugin container images the active adapter needs before we
-    start serving. Keyed off the adapter itself (not ``settings.isolation_mode``)
-    so this keeps working when the isolation default flips: only the container
-    adapter runs plugins from per-plugin images, so the subprocess adapter has
-    nothing to build. Broken plugins are logged and skipped, never fatal."""
-    if not isinstance(sandbox, ContainerSandboxRunner):
-        return
-    runtime = getattr(sandbox, "_runtime", "docker")
-    states = await ensure_images(registry.all(), runtime=runtime, sdk_source=sdk_source)
-    unavailable = sorted(pid for pid, state in states.items() if state != STATE_INSTALLED)
-    if unavailable:
-        logger.warning(
-            "plugin image(s) unavailable — runs for these will fail: %s",
-            ", ".join(unavailable),
-        )
-
-
-def _register_body(settings: RunnerSettings, registry) -> dict:
+def _register_body(settings: RunnerSettings, registry: Registry) -> dict:
     return {
         "id": settings.runner_id,
         "name": settings.name,
         "version": settings.version,
         "base_url": settings.advertised_url,
         "capabilities": ["enrichment"],
-        "isolation_mode": settings.isolation_mode,
+        "isolation_mode": ISOLATION_MODE,
         "plugins": registry.manifests(),
     }
 
 
 async def _heartbeat_loop(
-    client: PluginRunnerClient, settings: RunnerSettings, registry
+    client: PluginRunnerClient, settings: RunnerSettings, registry: Registry
 ) -> None:
     while True:
         try:
@@ -171,26 +154,20 @@ async def _heartbeat_loop(
 async def serve(
     settings: RunnerSettings | None = None,
     *,
-    runtime_check: RuntimeCheck | None = None,
+    uv_check: UvCheck | None = None,
 ) -> None:
     settings = settings or load_settings()
-    runtime_check = runtime_check or _container_runtime_available
-    registry = discover(settings.plugin_dirs)
-    logger.info("discovered %d plugin(s)", len(registry.all()))
-    set_installed_plugin_count(len(registry.all()))
+    uv_check = uv_check or _uv_available
+    # Preflight before we provision or enroll: no uv means every sync fails.
+    await _verify_uv(uv_check)
 
-    sandbox = select_sandbox(settings)
-    set_isolation_mode(sandbox.isolation_mode)
-    # Preflight before we enroll or build anything: if container isolation can't
-    # work, refuse to start rather than register as healthy and fail every run.
-    await _verify_container_runtime(sandbox, runtime_check)
-    await _ensure_plugin_images(sandbox, registry, sdk_source=settings.sdk_source)
+    registry = await _provision(settings, collect_garbage=True)
+    executor = SubprocessExecutor()
+    set_isolation_mode(ISOLATION_MODE)
 
-    # Construct the client directly from the shared secret + runner id (no
-    # enrollment exchange), then self-register once at startup to announce this
-    # runner and report its plugin manifests. Runs *after* the container-runtime
-    # preflight above: a runner with no usable runtime must never register as
-    # healthy.
+    # Self-register once at startup (no enrollment exchange), announcing this
+    # runner and its plugin manifests. Runs after the uv preflight so a runner
+    # with no usable uv never registers as healthy.
     client = PluginRunnerClient(
         settings.catlico_api_url,
         shared_secret=settings.shared_secret,
@@ -200,17 +177,20 @@ async def serve(
     await client.register(_register_body(settings, registry))
     logger.info("registered runner %s", settings.runner_id)
 
+    async def _rescan() -> None:
+        # Re-provision without GC and swap the live registry atomically.
+        fresh = await _provision(settings, collect_garbage=False)
+        registry.replace_all(fresh.all())
+        logger.info("rescan complete: %d plugin(s)", len(registry.all()))
+
     app = create_app(
         client=client,
         registry=registry,
         runner_id=settings.runner_id,
         api_base_url=settings.plugin_api_url or settings.catlico_api_url,
-        sandbox=sandbox,
-        # The shared secret is the push-verification key (both directions).
+        executor=executor,
         push_secret=lambda: settings.shared_secret,
-        sdk_source=settings.sdk_source,
-        build_runtime=settings.container_runtime,
-        install_root=Path(settings.install_root) if settings.install_root else None,
+        rescan=_rescan,
     )
     heartbeat = asyncio.create_task(_heartbeat_loop(client, settings, registry))
     config = uvicorn.Config(app, host=settings.host, port=settings.port, log_level="info")
@@ -221,9 +201,93 @@ async def serve(
         heartbeat.cancel()
 
 
-def main() -> None:
+# --- CLI subcommands --------------------------------------------------------
+
+
+async def sync_command(settings: RunnerSettings) -> int:
+    """Discover + provision every plugin venv. Exit non-zero on ANY failure."""
+    if not await _uv_available():
+        logger.error("uv is not usable; cannot sync plugin venvs")
+        return 1
+    registry = await _provision(settings, collect_garbage=True)
+    failed = [p for p in registry.all() if p.status != STATUS_READY]
+    for plugin in failed:
+        logger.error("plugin %s failed: %s", plugin.id, plugin.error)
+    return 1 if failed else 0
+
+
+_GIT_MARKERS = ("://", "git@")
+
+
+def _looks_like_git(source: str) -> bool:
+    return any(m in source for m in _GIT_MARKERS) or source.endswith(".git")
+
+
+def _name_from_git_url(source: str) -> str:
+    tail = source.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    return tail[:-4] if tail.endswith(".git") else tail
+
+
+def install_command(
+    settings: RunnerSettings, source: str, *, ref: str | None = None, name: str | None = None
+) -> int:
+    """Copy a local plugin dir or clone a git repo into the plugins dir.
+
+    Build-stage/dev tool only (no HTTP surface). Validates that the result holds a
+    ``catlico-plugin.toml``; a clone/copy that doesn't is removed and reported."""
+    plugins_dir = Path(settings.plugins_dir)
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+    src_path = Path(source)
+
+    if src_path.is_dir():
+        derived = name or src_path.name
+        dest = plugins_dir / derived
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(src_path, dest, ignore=shutil.ignore_patterns(".venv", "__pycache__"))
+    elif _looks_like_git(source):
+        derived = name or _name_from_git_url(source)
+        dest = plugins_dir / derived
+        try:
+            sha = clone_source(source, ref or "HEAD", dest)
+        except GitCloneError as exc:
+            logger.error("clone failed: %s", exc)
+            return 1
+        logger.info("cloned %s at %s", source, sha)
+    else:
+        logger.error("%s is neither a local directory nor a git URL", source)
+        return 1
+
+    if not (dest / "catlico-plugin.toml").is_file():
+        logger.error("%s has no catlico-plugin.toml — not a plugin; removing", dest)
+        shutil.rmtree(dest, ignore_errors=True)
+        return 1
+    logger.info("installed plugin into %s", dest)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="plugin-runner", description="Catlico plugin runner.")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("serve", help="provision venvs, register, and serve (default)")
+    sub.add_parser("sync", help="discover + provision every plugin venv; non-zero on failure")
+    p_install = sub.add_parser("install", help="copy/clone a plugin into the plugins dir")
+    p_install.add_argument("source", help="local plugin directory or a git URL")
+    p_install.add_argument("--ref", dest="ref", help="git ref (branch/tag/sha) for a git source")
+    p_install.add_argument("--name", dest="name", help="override the installed plugin dir name")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(serve())
+    args = build_parser().parse_args(argv)
+    settings = load_settings()
+    if args.command == "sync":
+        raise SystemExit(asyncio.run(sync_command(settings)))
+    if args.command == "install":
+        raise SystemExit(install_command(settings, args.source, ref=args.ref, name=args.name))
+    # Default (no subcommand) and explicit "serve".
+    asyncio.run(serve(settings))
 
 
 if __name__ == "__main__":

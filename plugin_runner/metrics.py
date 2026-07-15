@@ -100,6 +100,13 @@ installed_plugin_count = Gauge(
     registry=REGISTRY,
 )
 
+quarantined_plugin_count = Gauge(
+    "plugin_runner_quarantined_plugin_count",
+    "Number of discovered plugins quarantined (bad manifest or failed venv sync) "
+    "and therefore not dispatchable.",
+    registry=REGISTRY,
+)
+
 isolation_mode_info = Gauge(
     "plugin_runner_isolation_mode_info",
     "Always 1; the active isolation mode is carried on the `mode` label "
@@ -148,6 +155,10 @@ def observe_sandbox_duration(seconds: float) -> None:
 
 def set_installed_plugin_count(count: int) -> None:
     installed_plugin_count.set(count)
+
+
+def set_quarantined_plugin_count(count: int) -> None:
+    quarantined_plugin_count.set(count)
 
 
 def set_isolation_mode(mode: str) -> None:

@@ -1,13 +1,13 @@
 """Prometheus instrumentation: dispatch_event increments the right counters
-and observes sandbox duration on the runner's private registry.
+and observes execution duration on the runner's private registry.
 
 Mirrors tests/test_engine.py's fakes rather than importing them, since test
 modules here are standalone (no shared fixtures/__init__.py).
 """
 from plugin_runner.engine import dispatch_event
+from plugin_runner.executor import RunResult
 from plugin_runner.metrics import REGISTRY, record_run_failure
 from plugin_runner.registry import InstalledPlugin, Registry
-from plugin_runner.sandbox import SandboxRunResult
 
 
 class FakeClient:
@@ -39,7 +39,7 @@ class FakeClient:
         self.submitted = body
 
 
-class FakeSandbox:
+class FakeExecutor:
     def __init__(self, result):
         self._result = result
         self.requests = []
@@ -49,7 +49,7 @@ class FakeSandbox:
         return self._result
 
 
-class BrokenSandbox:
+class BrokenExecutor:
     """Raises inside the plugin's run, exercising the dispatch-error fallback."""
 
     async def run(self, request):
@@ -60,7 +60,7 @@ def _plugin(plugin_id="acme") -> InstalledPlugin:
     return InstalledPlugin(
         id=plugin_id, version="1.0.0",
         manifest={"triggers": ["observable.created"], "permissions": [], "timeout_seconds": 30},
-        module="acme.plugin", cls="Plugin", path="/plugins/acme/src",
+        module="main", app_object="catlico", path="/plugins/acme",
     )
 
 
@@ -92,9 +92,9 @@ async def test_created_success_run_increments_claim_terminal_and_duration():
     before_duration_count = _histogram_count("plugin_runner_sandbox_run_duration_seconds")
 
     client = FakeClient("created")
-    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
+    executor = FakeExecutor(RunResult(run_id="r1", status="success"))
     summary = await dispatch_event(
-        _ENVELOPE, client, _registry(), sandbox,
+        _ENVELOPE, client, _registry(), executor,
         runner_id="runner-1", api_base_url="http://c",
     )
 
@@ -111,9 +111,9 @@ async def test_suppressed_event_increments_suppressed_counter():
     before = _counter_value("plugin_runner_suppressed_events_total")
 
     client = FakeClient("created")
-    sandbox = FakeSandbox(SandboxRunResult(run_id="r1", status="success"))
+    executor = FakeExecutor(RunResult(run_id="r1", status="success"))
     summary = await dispatch_event(
-        {**_ENVELOPE, "actor": "plugin:acme@1.0.0"}, client, _registry(), sandbox,
+        {**_ENVELOPE, "actor": "plugin:acme@1.0.0"}, client, _registry(), executor,
         runner_id="runner-1", api_base_url="http://c",
     )
 
@@ -126,11 +126,11 @@ async def test_failure_with_error_kind_increments_failure_counter():
     before_failure = _counter_value("plugin_runner_run_failures_total", error_kind="transient")
 
     client = FakeClient("created")
-    sandbox = FakeSandbox(
-        SandboxRunResult(run_id="r1", status="failure", error="boom", error_kind="transient")
+    executor = FakeExecutor(
+        RunResult(run_id="r1", status="failure", error="boom", error_kind="transient")
     )
     summary = await dispatch_event(
-        _ENVELOPE, client, _registry(), sandbox,
+        _ENVELOPE, client, _registry(), executor,
         runner_id="runner-1", api_base_url="http://c",
     )
 
@@ -187,7 +187,7 @@ async def test_dispatch_exception_increments_dispatch_error_counter():
 
     client = FakeClient("created")
     summary = await dispatch_event(
-        _ENVELOPE, client, _registry(), BrokenSandbox(),
+        _ENVELOPE, client, _registry(), BrokenExecutor(),
         runner_id="runner-1", api_base_url="http://c",
     )
 
