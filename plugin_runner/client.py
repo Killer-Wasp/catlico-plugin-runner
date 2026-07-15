@@ -18,50 +18,35 @@ class PluginRunnerClient:
     def __init__(
         self,
         base_url: str,
-        secret: str = "",
+        shared_secret: str = "",
+        runner_id: str = "",
         *,
-        push_signing_secret: str = "",
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         self._base = base_url.rstrip("/")
-        self._secret = secret
+        self._secret = shared_secret
+        self._runner_id = runner_id
         self._timeout = timeout
         self._transport = transport
-        #: Captured from enrollment (or seeded here when resuming from persisted
-        #: state); used to verify API-to-runner push signatures.
-        self.push_signing_secret = push_signing_secret
 
     def _headers(self) -> dict[str, str]:
-        # During enrollment there is no credential yet: /register authenticates on
-        # the enrollment_token in the body, not a Bearer header. Emitting an empty
-        # "Bearer " value makes httpx reject the request locally (illegal header),
-        # so send no Authorization header until a secret exists.
-        if not self._secret:
-            return {}
-        return {"Authorization": f"Bearer {self._secret}"}
+        # The shared secret is the whole trust boundary; every internal call
+        # carries it plus the runner's identity header for routing.
+        return {
+            "Authorization": f"Bearer {self._secret}",
+            "X-Runner-Id": self._runner_id,
+        }
 
     def _url(self, path: str) -> str:
         return f"{self._base}{_INTERNAL_PREFIX}{path}"
 
     async def register(self, body: dict) -> dict:
-        """POST /register — upsert runner and plugin manifests."""
+        """POST /register — self-announce and upsert plugin manifests."""
         async with self._client() as client:
             r = await client.post(self._url("/register"), json=body, headers=self._headers())
             r.raise_for_status()
             return r.json()
-
-    async def enroll(self, body: dict) -> dict:
-        """Exchange an enrollment token for machine credentials, then adopt them.
-
-        ``body`` must include ``enrollment_token`` and the runner's reported
-        plugin manifests. Captures the runner credential (for all later calls)
-        and the push-signing secret (to verify inbound event pushes).
-        """
-        resp = await self.register(body)
-        self._secret = resp["runner_credential"]
-        self.push_signing_secret = resp.get("push_signing_secret", "")
-        return resp
 
     async def claim_run(self, body: dict) -> dict:
         """POST /runs — the multi-runner claim. Normalizes the API's responses:

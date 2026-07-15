@@ -139,12 +139,12 @@ class _FakeClient:
     instances: list = []
 
     def __init__(self, *args, **kwargs):
-        self.enroll_called = False
+        self.register_called = False
         _FakeClient.instances.append(self)
 
-    async def enroll(self, body):
-        self.enroll_called = True
-        return {"runner_credential": "cpr_fake", "push_signing_secret": "cps_fake"}
+    async def register(self, body):
+        self.register_called = True
+        return {"id": "runner-1", "status": "healthy"}
 
     async def sync(self):
         return {}
@@ -171,29 +171,25 @@ def _stub_serve(monkeypatch):
 
 
 async def test_serve_refuses_to_start_when_runtime_unavailable(_stub_serve, tmp_path):
-    # state_file under tmp_path (nonexistent) so bootstrap would take the enroll
-    # path — but the preflight must abort before that. No real state file.
+    # The container-runtime preflight must abort before the runner self-registers.
     settings = RunnerSettings(
         isolation_mode="container",
         plugin_dirs=[],
-        enrollment_token="tok",
-        state_file=str(tmp_path / "state.json"),
+        shared_secret="test-secret",
     )
     with pytest.raises(main.ContainerRuntimeUnavailable):
         await main.serve(settings, runtime_check=_down)
-    # Refuse means we never enroll — the runner must not register as healthy
+    # Refuse means we never register — the runner must not register as healthy
     # and then fail every claimed run.
-    assert all(not c.enroll_called for c in _stub_serve.instances)
+    assert all(not c.register_called for c in _stub_serve.instances)
 
 
 async def test_serve_proceeds_when_runtime_available(_stub_serve, tmp_path):
-    # No saved state → bootstrap enrolls with the token. state_file lives under
-    # tmp_path so the persisted credential never lands in the repo.
+    # A usable runtime lets serve() self-register on startup.
     settings = RunnerSettings(
         isolation_mode="container",
         plugin_dirs=[],
-        enrollment_token="tok",
-        state_file=str(tmp_path / "state.json"),
+        shared_secret="test-secret",
     )
     await main.serve(settings, runtime_check=_up)
-    assert any(c.enroll_called for c in _stub_serve.instances)
+    assert any(c.register_called for c in _stub_serve.instances)

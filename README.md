@@ -22,7 +22,7 @@ runner      ──posts result──────►  Catlico API
 Everything about this service follows from four rules:
 
 - **No database access.** Every state change goes through the Catlico internal API.
-- **No user tokens.** It authenticates with one machine credential minted at enrollment.
+- **No user tokens.** It authenticates with one shared secret configured on both the runner and the API.
 - **Browsers never reach it.** Its `/internal/*` surface is for the Catlico API host only —
   deploy it on a private network.
 - **Plugins never run in the runner process.** Plugin code is never imported into the
@@ -41,17 +41,17 @@ git clone https://github.com/Killer-Wasp/catlico-plugin-sdk.git
 cd catlico-plugin-runner
 
 make install
-# create the runner in Catlico to obtain a one-time enrollment token,
-# put it in .env (see docs/getting-started.md), then:
+# set PLUGIN_RUNNER_SHARED_SECRET (same value as the API) and
+# PLUGIN_RUNNER_ADVERTISED_URL in .env (see docs/getting-started.md), then:
 make run       # serves the private API on :8090
 ```
 
 Full walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
 
-> **Restarts work.** The runner persists its machine credential to a gitignored,
-> owner-only state file and resumes from it, so a restart does not re-spend the one-time
-> enrollment token. If an admin re-enrolls, the stale credential is rejected and the runner
-> re-enrolls automatically. See [docs/enrollment.md](docs/enrollment.md).
+> **Self-registration.** On startup the runner announces itself to the API in a single
+> `register` call, authenticated by the shared secret and reporting its advertised URL. There
+> is no token to mint and nothing persisted to disk — the shared secret is the whole trust
+> boundary. See [docs/enrollment.md](docs/enrollment.md).
 
 ## Isolation modes
 
@@ -81,8 +81,8 @@ Point it at any other plugin via `e2e/scenarios.json` or CLI flags — see
 
 | Doc | What's in it |
 |---|---|
-| [Getting started](docs/getting-started.md) | Setup, enrollment, configuration table, providing plugins, known gaps |
-| [Enrollment](docs/enrollment.md) | The one-time token exchange, credentials, rotation, the restart trap |
+| [Getting started](docs/getting-started.md) | Setup, shared-secret config, configuration table, providing plugins, known gaps |
+| [Runner authentication](docs/enrollment.md) | The shared-secret model, self-registration, event-push signing, rotation |
 | [Security model](docs/security.md) | Trust boundary, endpoint auth, sandbox hardening, secrets handling |
 | [End-to-end check](e2e/README.md) | Reusable e2e: drive any plugin through the runner and assert its result |
 
@@ -98,7 +98,7 @@ Contributors and AI agents: [`AGENTS.md`](AGENTS.md).
 
 ## Status
 
-Working: enrollment with credential persistence across restarts, heartbeat, signed event
+Working: shared-secret auth with self-registration on start, heartbeat, signed event
 push, subprocess and container sandboxes, timeout kill, secret-redacted log tails, the
 validate→build install pipeline (invoked at startup for container mode), result submission.
 Not yet wired: run cancellation is a stub; there is no metrics endpoint; the container

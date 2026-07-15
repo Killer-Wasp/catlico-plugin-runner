@@ -25,8 +25,8 @@ Every rule below is load-bearing. Breaking one collapses the isolation model.
 
 - **No database access.** It never touches Postgres. Every state change goes through
   the Catlico internal API.
-- **No public user tokens.** It authenticates with one machine credential minted at
-  enrollment. It never holds a browser user's session.
+- **No public user tokens.** It authenticates with one shared secret configured
+  identically on the runner and the API. It never holds a browser user's session.
 - **Browsers never reach it.** Its `/internal/*` surface is called only by the Catlico
   API host. Put it on a private network; never expose it publicly.
 - **Plugins never run in the runner process.** Every run is a separate process or a
@@ -41,9 +41,9 @@ path package `../catlico-plugin-sdk`, so the Docker build context must be the **
 
 ```
 plugin_runner/
-  main.py        # entrypoint: enroll, heartbeat loop, serve private API
+  main.py        # entrypoint: self-register, heartbeat loop, serve private API
   server.py      # the four /internal/* routes
-  client.py      # Catlico internal API client (enroll, claim, submit)
+  client.py      # Catlico internal API client (register, claim, submit)
   registry.py    # discovers plugin dirs containing catlico-plugin.toml
   sandbox.py     # SubprocessSandboxRunner + ContainerSandboxRunner
   engine.py      # run orchestration
@@ -51,27 +51,30 @@ plugin_runner/
   settings.py    # PLUGIN_RUNNER_* settings
 ```
 
-## Enrollment and credentials
+## Authentication and self-registration
 
-Enrollment is a **one-time token exchange**. An admin creates the runner in Catlico,
-which mints an enrollment token and sets `enrollment_state = pending`. The runner
-registers on startup with that token and receives:
+Auth is **one shared secret** (`PLUGIN_RUNNER_SHARED_SECRET`) configured identically on the
+runner and the Catlico API — the whole trust boundary. There is no token exchange, no minted
+credential, and nothing persisted to disk.
 
-- `runner_credential` (prefix `cpr_`) — long-lived machine credential, sent as
-  `Authorization: Bearer` on every later call. The API stores only its SHA-256 hash and
-  requires `enrollment_state == "enrolled"`.
-- `push_signing_secret` (prefix `cps_`) — per-runner HMAC key used to verify inbound
-  event pushes.
+On startup the runner constructs its API client directly from the shared secret and runner id,
+then calls `register()` **once** to self-announce — reporting its `PLUGIN_RUNNER_ADVERTISED_URL`
+(the URL the API uses to reach it for event/install pushes) and its installed plugin manifests.
+The container-runtime preflight runs *before* registration. There is no token to spend, no
+credential cache, and no re-enrollment recovery.
 
-The API then **consumes the token** and flips the runner to `enrolled`.
+Every runner→API request carries:
 
-> **Persistence.** The runner caches `runner_credential` and `push_signing_secret` in
-> `PLUGIN_RUNNER_STATE_FILE` (default `.runner-state.json`, owner-only `0600`, written
-> atomically, gitignored). On start it resumes from a valid saved credential and skips
-> enrollment; a `401/403` (e.g. after an admin re-enrollment) discards it and re-enrolls
-> with the token, while a `5xx`/network error propagates rather than throwing the
-> credential away. Rotation is admin-driven: re-creating the runner resets it to
-> `pending` and immediately invalidates the old credential.
+```
+Authorization: Bearer <shared_secret>
+X-Runner-Id: <runner_id>
+```
+
+> **Rotation.** Change `PLUGIN_RUNNER_SHARED_SECRET` on the API and every runner to the new
+> value and restart both sides together. A wrong secret means every call is simply rejected.
+>
+> Note: the per-run `runtime_token` (plugin sandbox → API) is a separate, unchanged concern —
+> do not conflate it with the runner shared secret.
 
 ## Private endpoints
 
@@ -87,7 +90,7 @@ Served on `PLUGIN_RUNNER_HOST:PLUGIN_RUNNER_PORT` (default `0.0.0.0:8090`).
 Only `/internal/events` is authenticated. The API signs the **raw request body**:
 
 ```
-x-catlico-signature: sha256=<hex hmac-sha256(push_signing_secret, raw_body)>
+x-catlico-signature: sha256=<hex hmac-sha256(shared_secret, raw_body)>
 ```
 
 The runner recomputes and compares in constant time; a missing/empty secret or bad
@@ -135,16 +138,14 @@ line; the runner splits that from the plugin's log output.
 ## Configuration
 
 All settings use the `PLUGIN_RUNNER_` prefix (`settings.py`): `RUNNER_ID` (default
-`runner-1`, must match the row the admin created), `NAME`, `VERSION`,
-`CATLICO_API_URL`, `ENROLLMENT_TOKEN` (only consulted without a usable persisted
-credential), `STATE_FILE` (default `.runner-state.json`), `PLUGIN_DIRS` (JSON list),
+`runner-1`, stable id for this runner), `NAME`, `VERSION`, `CATLICO_API_URL`,
+`SHARED_SECRET` (auth secret; must match the API's value), `ADVERTISED_URL` (URL the API
+uses to reach this runner, self-reported at registration), `PLUGIN_DIRS` (JSON list),
 `ISOLATION_MODE` (default `container`), `HOST`, `PORT`,
 `HEARTBEAT_INTERVAL_SECONDS`, `HTTP_TIMEOUT`.
 
-The runner authenticates with the enrolled credential; there is **no static shared
-secret in this service**. (The *API* still defines a deprecated `PLUGIN_RUNNER_SHARED_SECRET`
-knob in `app/core/configs.py`, but nothing reads it.) There is **no Prometheus
-`/metrics` endpoint.**
+The runner authenticates with `PLUGIN_RUNNER_SHARED_SECRET`, held in the environment and
+never cached to disk. There is **no Prometheus `/metrics` endpoint.**
 
 ## Known gaps — do not assume these work
 
@@ -160,7 +161,7 @@ knob in `app/core/configs.py`, but nothing reads it.) There is **no Prometheus
 
 ```bash
 make install   # uv sync (incl. dev group)
-make run       # enroll, heartbeat, serve private API on :8090
+make run       # self-register, heartbeat, serve private API on :8090
 make dev       # same, auto-restart on runner/SDK changes
 make test      # uv run pytest
 make build     # docker build (context is the repo root)
@@ -169,13 +170,13 @@ make build     # docker build (context is the repo root)
 Tests are Docker-optional: container-security tests are guarded by
 `skipif(not shutil.which("docker"))` and skip cleanly; command construction, sentinel
 parsing, manifest validation, Dockerfile generation, subprocess execution, and
-enrollment all run without Docker.
+registration all run without Docker.
 
 ## Related
 
 - `catlico-plugin-sdk/AGENTS.md` — the authoring contract this service executes
 - `catlico-plugins/AGENTS.md` — the plugins themselves
-- `docs/` — the full reference: `getting-started.md`, `enrollment.md` (incl. troubleshooting), `security.md`
+- `docs/` — the full reference: `getting-started.md`, `enrollment.md` (runner authentication, incl. troubleshooting), `security.md`
 
 When documentation and code disagree, treat the code and tests as the source of truth,
 then update the stale doc.

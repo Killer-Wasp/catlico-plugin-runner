@@ -9,9 +9,5 @@ __pycache__/
 .env.*
 !.env.example
 
-# Persisted runner credentials (bearer secrets) — never commit
-.runner-state.json
-.runner-state.json.tmp
-
 # e2e: runner-scoping symlink dir created by e2e/start_runner.sh
 e2e/.scoped-plugins/

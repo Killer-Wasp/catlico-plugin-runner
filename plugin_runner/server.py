@@ -2,8 +2,8 @@
 
 Catlico calls these ``/internal/*`` endpoints on the runner host. They are not
 public web endpoints. Event pushes are authenticated by an HMAC signature over the
-raw request body, keyed by the per-runner push-signing secret captured at
-enrollment.
+raw request body, keyed by the shared secret configured on both the API and the
+runner.
 """
 from __future__ import annotations
 
@@ -60,8 +60,9 @@ def create_app(
     install_root: Path | None = None,
     spawn: Callable[[Awaitable], object] | None = None,
 ) -> Starlette:
-    """Build the runner's private app. ``push_secret`` is a callable so the app
-    picks up the enrollment secret once it is set post-enrollment.
+    """Build the runner's private app. ``push_secret`` is a callable resolving to
+    the shared secret used to verify inbound event/install push signatures
+    (``main.serve`` passes ``lambda: settings.shared_secret``).
 
     ``installer``/``spawn`` are injectable so the background install can be driven
     and observed in tests: ``installer`` defaults to ``install_from_source`` and
@@ -71,7 +72,7 @@ def create_app(
     ``sdk_source``/``build_runtime`` feed the installer's build step;
     ``install_root`` is the parent dir clones land under (keyed by plugin_id)."""
     sandbox = sandbox or SubprocessSandboxRunner()
-    push_secret = push_secret or (lambda: client.push_signing_secret)
+    push_secret = push_secret or (lambda: getattr(client, "push_signing_secret", ""))
     install_root = install_root or (Path(tempfile.gettempdir()) / "catlico-plugin-installs")
 
     # Retain a strong reference to every background install task for its whole
