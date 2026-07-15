@@ -1,106 +1,75 @@
-# Enrollment and credentials
+# Runner authentication (shared secret)
 
-The runner ships with **no credential**. It obtains one through a one-time token exchange with
-the Catlico API.
+The runner and the Catlico API authenticate each other with **one shared secret**,
+configured identically on both sides. There is no token exchange, no minted per-runner
+credential, and nothing persisted to disk — the shared secret is the whole trust boundary.
 
-## The exchange
+## Configuration
 
-1. **An admin creates the runner** in Catlico:
-   `POST /api/v1/plugin-runners` with an `id`, `name`, and the runner's `base_url`.
-   This mints a **one-time enrollment token** and sets `enrollment_state = pending`. The token
-   expires after `PLUGIN_RUNNER_ENROLLMENT_TOKEN_TTL_SECONDS` (default 900s, set on the API).
+Set the same value on both the API and the runner:
 
-2. **An operator configures the runner** with that token:
+```bash
+PLUGIN_RUNNER_SHARED_SECRET=<same value as the Catlico API>
+PLUGIN_RUNNER_RUNNER_ID=<stable id for this runner>
+PLUGIN_RUNNER_CATLICO_API_URL=https://catlico.example.com
+PLUGIN_RUNNER_ADVERTISED_URL=https://runner.internal.example.com:8090
+```
 
-   ```bash
-   PLUGIN_RUNNER_ENROLLMENT_TOKEN=<token from the admin>
-   PLUGIN_RUNNER_RUNNER_ID=<must match the id the admin used>
-   PLUGIN_RUNNER_CATLICO_API_URL=https://catlico.example.com
-   ```
+Generate a secret with:
 
-3. **The runner registers on startup**, POSTing to
-   `/api/internal/plugin-runner/register` with the enrollment token and its installed plugin
-   manifests.
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
 
-4. **The API validates and responds.** The token must belong to a `pending` runner, match the
-   stored hash, and be unexpired. On success the API returns two secrets:
+`PLUGIN_RUNNER_ADVERTISED_URL` is the URL the **Catlico API** uses to reach this runner for
+event and install pushes. The runner self-reports it at registration, so it must be resolvable
+*from the API host*, not just locally.
 
-   | Secret | Prefix | Purpose |
-   |---|---|---|
-   | `runner_credential` | `cpr_` | Long-lived machine credential. Sent as `Authorization: Bearer` on every later call. The API stores only its SHA-256 hash and requires `enrollment_state == "enrolled"`. |
-   | `push_signing_secret` | `cps_` | Per-runner HMAC key. The runner uses it to verify inbound event pushes from the API. |
+## Self-registration
 
-   The API then **consumes the token** (clears its hash) and flips the runner to `enrolled`.
+On startup the runner constructs its API client directly from the shared secret and runner id,
+then calls `register()` **once** to announce itself — reporting its `advertised_url` and its
+installed plugin manifests. There is no token to spend, no credential to cache, and no
+re-enrollment recovery: if the shared secret is wrong, every call is simply rejected. (The
+container-runtime preflight still runs *before* registration.)
 
-## Credential persistence (restarts)
+Every runner→API request carries:
 
-> The runner **persists** `runner_credential` and `push_signing_secret` to a state file
-> (`PLUGIN_RUNNER_STATE_FILE`, default `.runner-state.json`), created owner-only (`0600`) and
-> written atomically. It is gitignored.
-
-The enrollment token is one-time — the API clears it on the first successful `register` — so
-the runner resumes from the saved credential rather than re-spending the token. Startup order:
-
-1. If saved state exists, validate the credential against the API (`GET /sync`).
-   - Succeeds → **resume; enrollment is skipped entirely.**
-   - `401`/`403` → the credential is dead (this is exactly what an admin re-enrollment causes:
-     the runner is set back to `pending`). Discard it and enroll with the token, overwriting state.
-   - `5xx` / connection error → propagate. A transient API outage must not throw away a
-     credential that cannot be re-minted.
-2. If there is no usable credential and no token, startup fails with an actionable error
-   telling the operator to mint one.
-
-Corrupt, truncated, or partial state warns and falls back to enrolling rather than bricking
-startup. **Recovery never requires deleting files by hand:** to rotate, reset the runner to
-`pending` in Catlico, supply a fresh token, and restart.
-
-> **Deployment note.** The default state path is relative to the working directory. In a
-> container, point `PLUGIN_RUNNER_STATE_FILE` at a persistent volume — otherwise the credential
-> survives process restarts but not container recreation.
-
-## Revocation and rotation
-
-There is no runner-side rotation flow. Rotation is driven from the admin API.
-
-To revoke or rotate, an admin **re-creates the runner** (the same `POST`), which:
-
-- sets `enrollment_state` back to `pending`,
-- issues a fresh enrollment token.
-
-Because authentication requires `enrolled`, the previously issued `runner_credential` **stops
-working immediately**. The runner must re-register with the new token to obtain a new
-credential and a new push secret.
+```
+Authorization: Bearer <shared_secret>
+X-Runner-Id: <runner_id>
+```
 
 ## Event-push authentication
 
-Only `/internal/events` is authenticated. The API signs the **raw request body** with the
-runner's `push_signing_secret`:
+Inbound event and install pushes from the API to the runner (`/internal/events`) are signed
+with the same shared secret. The API signs the **raw request body**:
 
 ```
-x-catlico-signature: sha256=<hex hmac-sha256(push_signing_secret, raw_body)>
+x-catlico-signature: sha256=<hex hmac-sha256(shared_secret, raw_body)>
 ```
 
-The runner recomputes the HMAC with the secret captured at enrollment and compares in constant
-time. A missing or empty secret, or a bad signature, returns `401`.
+The runner recomputes the HMAC with its shared secret and compares in constant time. A missing
+or empty secret, or a bad signature, returns `401`.
 
 `/internal/health` and `/internal/plugins` are **not signed and not authenticated**. The private
 network is the only control on them — see [security.md](security.md).
 
+## Rotation
+
+To rotate, change `PLUGIN_RUNNER_SHARED_SECRET` on the API and on every runner to the new value
+and restart. Because both sides read the same secret, they must be updated together.
+
 ## Troubleshooting
 
-**`Invalid plugin runner enrollment token` on start.** The token is one-time and
-unexpired-only. With a healthy state file the runner never re-presents it, so this means the
-token was already spent *and* the saved credential is missing or rejected (state file deleted,
-or an admin reset the runner to `pending`), or the TTL lapsed before first enrollment. Have an
-admin re-create the runner to issue a fresh token, then start.
+**Runner→API calls return 401/403.** The runner's `PLUGIN_RUNNER_SHARED_SECRET` does not match
+the value the API expects. Confirm both sides hold the identical secret and restart.
 
-**Event pushes return 401.** The runner's `push_signing_secret` and the API's stored
-secret disagree — typically because the runner re-enrolled and got a new secret while a delivery
-was in flight with the old one, or because the runner never completed enrollment. Re-enroll so
-both sides share a fresh secret.
+**Event pushes return 401.** The runner and API shared secrets disagree, so the HMAC signature
+fails to verify. Align the secret on both sides.
 
 **Runner shows offline / unhealthy in Catlico.** The API marks a runner unhealthy when
 `POST /api/v1/plugin-runners/{id}/health-check` — which calls the runner's `GET /internal/health`
-— can't reach it. Confirm the `base_url` the admin registered is reachable *from the API host*,
-and that the process is listening on `PLUGIN_RUNNER_PORT`. Heartbeats also update liveness every
-`PLUGIN_RUNNER_HEARTBEAT_INTERVAL_SECONDS`.
+— can't reach it. Confirm the `advertised_url` the runner reported is reachable *from the API
+host*, and that the process is listening on `PLUGIN_RUNNER_PORT`. Heartbeats also update liveness
+every `PLUGIN_RUNNER_HEARTBEAT_INTERVAL_SECONDS`.

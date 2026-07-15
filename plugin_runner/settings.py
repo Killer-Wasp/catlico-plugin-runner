@@ -15,6 +15,17 @@ class RunnerSettings(BaseSettings):
     #: Base URL of the Catlico API (control plane) as reached by the *runner*.
     catlico_api_url: str = "http://localhost:8000"
 
+    #: Shared secret configured identically on the Catlico API and this runner.
+    #: It is the whole trust boundary: every internal call sends it as
+    #: ``Authorization: Bearer <secret>`` (plus ``X-Runner-Id``), and inbound
+    #: event/install pushes are HMAC-verified against it.
+    shared_secret: str = ""
+
+    #: The URL the Catlico API uses to reach this runner for event/install
+    #: pushes. Self-reported at registration (there is no admin pre-provisioning
+    #: step any more). Empty leaves the API unable to push to this runner.
+    advertised_url: str = ""
+
     #: Base URL the *plugin sandbox* uses to reach the Catlico runtime API. Empty
     #: (default) reuses ``catlico_api_url``. Override it when a plugin container
     #: cannot resolve the runner's own URL — e.g. local container-isolation dev on
@@ -23,16 +34,6 @@ class RunnerSettings(BaseSettings):
     #: ``http://host.docker.internal:8000`` (the ``host.docker.internal`` hostname
     #: is made resolvable via ``--add-host`` in the container adapter).
     plugin_api_url: str = ""
-
-    #: One-time enrollment token, issued by Catlico when the runner is registered.
-    #: Only consulted when there is no usable persisted credential (first start,
-    #: or recovery after the API rejects a stale credential). See ``state_file``.
-    enrollment_token: str = ""
-
-    #: Where the machine credential and push-signing secret from enrollment are
-    #: cached so restarts resume instead of re-spending the one-time token. Holds
-    #: bearer secrets: created 0600 and written atomically. Must be gitignored.
-    state_file: str = ".runner-state.json"
 
     #: Directories scanned for locally-provisioned plugins (Docker volume mounts).
     plugin_dirs: list[str] = []

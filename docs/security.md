@@ -7,8 +7,8 @@ breaking one rule collapses the isolation model.
 
 - **No database access.** The runner never touches Postgres. Every state change — runs, results,
   plugin inventory — goes through the Catlico internal API.
-- **No public user tokens.** It authenticates with a single machine credential minted at
-  enrollment. It never holds a browser user's session.
+- **No public user tokens.** It authenticates with a single shared secret configured
+  identically on the runner and the API. It never holds a browser user's session.
 - **Browsers never reach it.** Its HTTP surface is a private `/internal/*` API called only by the
   Catlico API host. **Put it on a private network. Do not expose it publicly.**
 - **Plugins never run in the runner process.** Each run executes in a separate process
@@ -29,7 +29,7 @@ Three of the four routes are unauthenticated. **Network isolation is the only co
 discloses the runner id and plugin count. Neither exposes secrets, but neither should be
 reachable from the internet.
 
-See [enrollment.md](enrollment.md) for the HMAC scheme.
+See [enrollment.md](enrollment.md) for the shared-secret model and the HMAC scheme.
 
 ## Isolation modes
 
@@ -106,13 +106,12 @@ The log tail is truncated to the **last 64 KB** (`LOG_TAIL_MAX_BYTES`).
 ## What the runner does not have
 
 - **No `/metrics` endpoint.** No Prometheus instrumentation.
-- **No static shared secret.** Runner→API auth is the enrolled `runner_credential`; API→runner
-  pushes use the per-runner HMAC secret. (The *API* still defines a deprecated
-  `PLUGIN_RUNNER_SHARED_SECRET` config knob, but nothing in the codebase reads it — it
-  authenticates nothing.)
-- **No runner-side rotation flow.** Credentials persist in an owner-only (`0600`) state file
-  and rotation is driven from the admin API — see [enrollment.md](enrollment.md). Point
-  `PLUGIN_RUNNER_STATE_FILE` at a persistent volume in containerised deployments.
+- **No persisted credential.** Auth is the single `PLUGIN_RUNNER_SHARED_SECRET`, held in the
+  environment on both the runner and the API. Runner→API calls send it as
+  `Authorization: Bearer`; API→runner pushes are HMAC-signed with the same secret. Nothing is
+  cached to disk — see [enrollment.md](enrollment.md).
+- **No runner-side rotation flow.** To rotate, change `PLUGIN_RUNNER_SHARED_SECRET` on the API
+  and every runner to the new value and restart both sides together.
 
 ## Reporting a vulnerability
 

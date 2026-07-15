@@ -25,34 +25,31 @@ cd catlico-plugin-runner
 make install    # uv sync, including the dev group
 ```
 
-### Enroll
+### Configure the shared secret
 
-The runner cannot start usefully without an enrollment token. In Catlico (as a superadmin),
-create the runner — this mints a one-time token:
+The runner and the Catlico API authenticate each other with **one shared secret**. Set
+`PLUGIN_RUNNER_SHARED_SECRET` on the runner to the same value the API is configured with, and
+set `PLUGIN_RUNNER_ADVERTISED_URL` to the URL the API should use to reach this runner. On
+startup the runner self-registers — no token to mint, nothing persisted.
 
-```
-POST /api/v1/plugin-runners
-{ "id": "runner-1", "name": "Dev runner", "base_url": "http://localhost:8090" }
-```
-
-Then put the token in `.env`:
+Put these in `.env`:
 
 ```bash
 PLUGIN_RUNNER_RUNNER_ID=runner-1
-PLUGIN_RUNNER_ENROLLMENT_TOKEN=<the token>
+PLUGIN_RUNNER_SHARED_SECRET=<same value as the Catlico API>
+PLUGIN_RUNNER_ADVERTISED_URL=http://localhost:8090
 PLUGIN_RUNNER_CATLICO_API_URL=http://localhost:8000
 PLUGIN_RUNNER_PLUGIN_DIRS=["/absolute/path/to/catlico-plugins"]
 ```
 
-The token is **one-time**, but the runner persists the credential it receives to an
-owner-only state file (`PLUGIN_RUNNER_STATE_FILE`) and resumes from it, so restarts do not
-need a fresh token. In a container, point that path at a persistent volume. The full story,
-including rotation and troubleshooting, is in [enrollment.md](enrollment.md).
+Generate a secret with `python -c "import secrets; print(secrets.token_hex(32))"`.
+`PLUGIN_RUNNER_ADVERTISED_URL` must be reachable *from the API host*. The full story, including
+rotation and troubleshooting, is in [enrollment.md](enrollment.md).
 
 ### Run
 
 ```bash
-make run    # enroll, start the heartbeat loop, serve the private API on :8090
+make run    # self-register, start the heartbeat loop, serve the private API on :8090
 make dev    # same, but auto-restarts when runner or SDK code changes
 ```
 
@@ -79,8 +76,8 @@ All settings use the `PLUGIN_RUNNER_` prefix (`plugin_runner/settings.py`):
 | `PLUGIN_RUNNER_VERSION` | `0.1.0` | Version reported at registration |
 | `PLUGIN_RUNNER_CATLICO_API_URL` | `http://localhost:8000` | Catlico API base URL, as reached by the **runner** |
 | `PLUGIN_RUNNER_PLUGIN_API_URL` | `""` | Catlico API base URL as reached by a **plugin sandbox**; empty reuses `CATLICO_API_URL`. Set it when a plugin container can't resolve the runner's URL — e.g. local container-isolation dev on Docker Desktop, where the API is on the host: `http://host.docker.internal:8000` |
-| `PLUGIN_RUNNER_ENROLLMENT_TOKEN` | `""` | One-time enrollment token; only consulted when no usable persisted credential exists |
-| `PLUGIN_RUNNER_STATE_FILE` | `.runner-state.json` | Owner-only (`0600`) cache of the enrolled credential + push secret; point at a persistent volume in containers |
+| `PLUGIN_RUNNER_SHARED_SECRET` | `""` | Shared secret authenticating the runner to the API and signing inbound event pushes; must match the API's value. Generate with `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `PLUGIN_RUNNER_ADVERTISED_URL` | `""` | URL the Catlico API uses to reach this runner for event/install pushes; self-reported at registration and must be reachable from the API host |
 | `PLUGIN_RUNNER_PLUGIN_DIRS` | `[]` | Directories scanned for plugins (JSON list) |
 | `PLUGIN_RUNNER_ISOLATION_MODE` | `container` | `container` (hardened, the default) or `subprocess` (trusted dev only); anything else is rejected at startup |
 | `PLUGIN_RUNNER_CONTAINER_RUNTIME` | `docker` | Container runtime binary the container adapter shells out to (e.g. `podman`); ignored in `subprocess` mode |
@@ -106,7 +103,7 @@ make test    # uv run pytest
 The suites are Docker-optional. Container-security enforcement tests are guarded by
 `skipif(not shutil.which("docker"))` and skip cleanly when Docker is absent; command
 construction, sentinel parsing, manifest validation, Dockerfile generation, subprocess
-execution, and enrollment all run without Docker.
+execution, and registration all run without Docker.
 
 ## Building the image
 
@@ -135,6 +132,6 @@ Be aware of these before assuming a feature works:
 
 ## Where to go next
 
-- [enrollment.md](enrollment.md) — the credential exchange, persistence across restarts, rotation
+- [enrollment.md](enrollment.md) — the shared-secret model, self-registration, event-push signing, rotation
 - [security.md](security.md) — trust boundary, isolation modes, container hardening
 - [`AGENTS.md`](../AGENTS.md) — conventions for contributors and AI agents
