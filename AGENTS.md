@@ -166,7 +166,7 @@ StackStorm host-site-packages isolation proof) and skip cleanly when uv is unava
 
 - `catlico-plugin-sdk/AGENTS.md` — the authoring contract this service executes
 - `catlico-plugins/AGENTS.md` — the plugins themselves
-- `docs/` — the full reference: `getting-started.md`, `enrollment.md` (runner authentication, incl. troubleshooting), `security.md`
+- `docs/` — the full reference: `getting-started.md`, `authentication.md` (runner authentication, incl. troubleshooting), `security.md`
 
 When documentation and code disagree, treat the code and tests as the source of truth,
 then update the stale doc.

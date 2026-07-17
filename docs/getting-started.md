@@ -50,7 +50,7 @@ PLUGIN_RUNNER_SDK_SOURCE=../catlico-plugin-sdk   # dev: editable SDK in each ven
 
 Generate a secret with `python -c "import secrets; print(secrets.token_hex(32))"`.
 `PLUGIN_RUNNER_ADVERTISED_URL` must be reachable *from the API host*. On startup the runner
-self-registers — no token to mint, nothing persisted. Full story: [enrollment.md](enrollment.md).
+self-registers — no token to mint, nothing persisted. Full story: [authentication.md](authentication.md).
 
 ### Run
 
@@ -153,6 +153,6 @@ image extends it: `FROM catlico/plugin-runner`, then
 
 ## Where to go next
 
-- [enrollment.md](enrollment.md) — the shared-secret model, self-registration, event-push signing, rotation
+- [authentication.md](authentication.md) — the shared-secret model, self-registration, event-push signing, rotation
 - [security.md](security.md) — the trust model (no sandbox), endpoint auth, secrets handling
 - [`AGENTS.md`](../AGENTS.md) — conventions for contributors and AI agents

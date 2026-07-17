@@ -75,7 +75,7 @@ loudly at load, not mid-run.
 
 The unauthenticated routes disclose the plugin inventory (with status/error), the runner id, and
 metrics — no secrets, but **network isolation is the only control on them**. See
-[enrollment.md](enrollment.md) for the shared-secret model and HMAC scheme.
+[authentication.md](authentication.md) for the shared-secret model and HMAC scheme.
 
 ## Timeouts
 
