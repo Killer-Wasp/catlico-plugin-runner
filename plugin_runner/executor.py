@@ -60,6 +60,10 @@ class RunRequest:
     action: str = "event"  # "event" | "health"
 
 
+#: Valid status values for plugin run results.
+VALID_STATUSES = {"success", "failure", "timeout", "skipped"}
+
+
 @dataclass
 class RunResult:
     """Output from a plugin execution."""
@@ -142,6 +146,20 @@ def _log_tail(
     return _tail(text.encode("utf-8", errors="replace"), limit)
 
 
+def _validate_status(status: str | None) -> tuple[str, str | None]:
+    """Validate the status string from a plugin result file.
+
+    Returns (validated_status, error_text). If status is valid, error_text is None.
+    Unknown statuses coerce to "failure" with the original value in the error text.
+    """
+    if status is None:
+        return "failure", None
+    if status in VALID_STATUSES:
+        return status, None
+    # Unknown status: coerce to failure, preserve original in error
+    return "failure", f"invalid status from plugin result: '{status}' (expected one of {sorted(VALID_STATUSES)})"
+
+
 class SubprocessExecutor(PluginExecutor):
     """The execution adapter: one plugin run per child Python process.
 
@@ -214,10 +232,16 @@ class SubprocessExecutor(PluginExecutor):
                     error_kind="bug",
                     log_tail=log_tail,
                 )
+            status_value = result.get("status", "failure")
+            validated_status, status_error = _validate_status(status_value)
+            # If status was invalid, prepend the validation error to any existing error
+            error = result.get("error")
+            if status_error:
+                error = f"{status_error}. {error}" if error else status_error
             return RunResult(
                 run_id=request.run_id,
-                status=result.get("status", "failure"),
-                error=result.get("error"),
+                status=validated_status,
+                error=error,
                 error_kind=result.get("error_kind"),
                 skip_reason=result.get("skip_reason"),
                 result_summary=result.get("result_summary"),

@@ -78,7 +78,7 @@ python e2e/e2e_check.py observable-validator  # → ✓ PASS
 | Doc | What's in it |
 |---|---|
 | [Getting started](docs/getting-started.md) | Setup, config table, providing plugins, the CLI, registries/wheelhouses, known gaps |
-| [Runner authentication](docs/enrollment.md) | Shared-secret model, self-registration, event-push signing, rotation |
+| [Runner authentication](docs/authentication.md) | Shared-secret model, self-registration, event-push signing, rotation |
 | [Security model](docs/security.md) | The trust model (no sandbox), endpoint auth, secrets handling |
 | [End-to-end check](e2e/README.md) | Drive any plugin through the runner and assert its result |
 
