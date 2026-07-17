@@ -179,6 +179,26 @@ async def test_sdk_source_flip_rebuilds_and_installs_editable(tmp_path):
     assert json.loads(marker.read_text())["sdk_source"] == "/path/to/sdk"
 
 
+async def test_relative_sdk_source_is_resolved_to_absolute(tmp_path):
+    # The editable install runs with cwd=plugin_root, so a relative sdk_source
+    # would resolve against the plugin dir and miss the sibling SDK checkout. It
+    # must be pinned to an absolute path (against the runner's CWD) before use.
+    root = _plugin_dir(tmp_path, "acme")
+    uv = FakeUv()
+
+    result = await _ensure(root, tmp_path, run_uv=uv, sdk_source="../some-sdk")
+    assert result.ok
+
+    install = next(c for c in uv.calls if c[:3] == ["uv", "pip", "install"])
+    sdk_arg = install[install.index("-e") + 1]
+    assert Path(sdk_arg).is_absolute(), sdk_arg
+    assert sdk_arg == str(Path("../some-sdk").resolve())
+    # ...and the marker records the resolved (absolute) form, so the warm path
+    # short-circuits instead of rebuilding every startup.
+    marker = Path(result.python).parents[1] / MARKER_NAME
+    assert json.loads(marker.read_text())["sdk_source"] == str(Path("../some-sdk").resolve())
+
+
 async def test_sdk_install_failure_is_reported(tmp_path):
     root = _plugin_dir(tmp_path, "acme")
 

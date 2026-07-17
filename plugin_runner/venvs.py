@@ -146,6 +146,15 @@ async def ensure_venv(
     full success. A failure keeps the markerless partial dir (self-repairs next
     sync) and returns ``ok=False`` with a captured uv output tail — it never raises.
     """
+    # The editable SDK install below runs with cwd=plugin_root (so `uv sync`
+    # sees the plugin's own project), which means a *relative* sdk_source like
+    # "../catlico-plugin-sdk" would resolve against the plugin's directory and
+    # miss. It's documented as relative to the runner's launch dir, so pin it to
+    # an absolute path here — before the marker compare, so the recorded value is
+    # stable and the warm path still short-circuits.
+    if sdk_source:
+        sdk_source = str(Path(sdk_source).resolve())
+
     lock_sha = _lock_sha(plugin_root)
     if lock_sha is None:
         return VenvResult(
