@@ -227,3 +227,56 @@ async def handle(event, ctx):
     assert result.status == "success", result.error
     assert "***REDACTED***" not in (result.log_tail or "")
     assert "processed 1 item ok=true count=0 done" in (result.log_tail or "")
+
+
+# --- Status validation ---
+
+
+async def test_unknown_status_coerces_to_failure(tmp_path):
+    """Unknown status strings from result file are coerced to failure with original preserved."""
+    path = _write_app(
+        tmp_path,
+        _APP_HEADER + """
+import json
+from pathlib import Path
+
+@catlico.event("observable.created")
+async def handle(event, ctx):
+    # Manually write result with invalid status
+    # (plugin code can access result_path via ctx.result_path)
+    pass
+""",
+    )
+    # We'll test at a lower level by mocking the result file
+    from unittest.mock import patch
+    import json
+
+    executor = SubprocessExecutor()
+    # Create a mock result with an invalid status
+    mock_result = {
+        "status": "completed",  # Invalid status
+        "error": "some error",
+    }
+
+    with patch.object(executor, "_read_result", return_value=mock_result):
+        result = await executor.run(_request(path))
+        assert result.status == "failure", "Invalid status should coerce to failure"
+        assert result.error is not None
+        assert "invalid status from plugin result" in result.error
+        assert "'completed'" in result.error
+        assert "some error" in result.error
+
+
+async def test_valid_statuses_pass_through(tmp_path):
+    """All valid statuses (success, failure, timeout, skipped) should pass through unchanged."""
+    from unittest.mock import patch
+
+    executor = SubprocessExecutor()
+    for valid_status in ["success", "failure", "timeout", "skipped"]:
+        # Create a unique directory for each status test
+        status_dir = tmp_path / valid_status
+        status_dir.mkdir(exist_ok=True)
+        mock_result = {"status": valid_status}
+        with patch.object(executor, "_read_result", return_value=mock_result):
+            result = await executor.run(_request(_write_app(status_dir, _APP_HEADER)))
+            assert result.status == valid_status, f"Status {valid_status} should pass through"
